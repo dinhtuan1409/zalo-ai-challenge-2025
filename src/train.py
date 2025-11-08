@@ -4,18 +4,18 @@ import torch
 import random
 import numpy as np
 import torch.nn as nn
-import json # MỚI: Để lưu metadata
+import json 
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
-from transformers import AutoTokenizer # MỚI: Cần cho LLM
+from transformers import AutoTokenizer # Cần cho LLM
 
-# --- MỚI: Giả sử bạn đã cập nhật các file này ---
-# (Bạn cần tự tạo các file này dựa trên hướng dẫn trước)
-from model import VideoTextLLMQA_V2 # THAY ĐỔI: Import mô hình V2
+# --- Import các file code của bạn ---
+from model import VideoTextLLMQA_V2 
 from dataset import (
-    FeatureVideoQADatasetMPNET, # Giả sử dataset này đã được sửa
-    collate_fn_mpnet            # Giả sử collate_fn này đã được sửa
+    FeatureVideoQADatasetMPNET, 
+    collate_fn_mpnet, 
+    load_text_encoder # Dùng lại hàm load MPNet từ dataset.py
 )
 
 # ===========================
@@ -25,22 +25,22 @@ DATA_JSON = "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+
 VIDEO_FEAT_DIR = "Feature/train"
 
 # --- Config cho mô hình V2 ---
-LLM_MODEL_NAME = "mistralai/Mistral-7B-v0.1" # ĐÃ SỬA: Dùng Mistral 7B (Open Access)
+LLM_MODEL_NAME = "mistralai/Mistral-7B-v0.1" 
 VIDEO_FEAT_DIM = 2304 
-TEXT_FEAT_DIM = 768 # Giữ nguyên dim của text_feats (MPNet/CLIP)
+TEXT_FEAT_DIM = 768 # MPNet dim
 
 # --- Config huấn luyện (Điều chỉnh cho PEFT) ---
-BATCH_SIZE = 4        # THAY ĐỔI: Giảm BS vì LLM tốn VRAM
-ACCUM_STEPS = 4       # THAY ĐỔI: Tăng ACCUM (Effective BS = 4*4 = 16)
-LR = 1e-4             # THAY ĐỔI: Learning rate phổ biến cho LoRA
-EPOCHS = 10           # Giảm epochs, vì LLM hội tụ nhanh hơn
+BATCH_SIZE = 4        
+ACCUM_STEPS = 4       
+LR = 1e-4             
+EPOCHS = 10           
 WEIGHT_DECAY = 0.01
 VALID_SPLIT = 0.1
 OUTPUT_DIR = "/kaggle/working/"
 
 SEED = 42
 USE_FP16 = True
-EARLYSTOP_PATIENCE = 2 # Giảm patience
+EARLYSTOP_PATIENCE = 2
 CLIP_NORM = 1.0
 NUM_WORKERS = os.cpu_count()
 
@@ -65,15 +65,15 @@ def evaluate(model, loader, loss_fn, device):
     with torch.no_grad():
         pbar = tqdm(loader, desc="Eval", leave=False)
         for batch in pbar:
-            # THAY ĐỔI: Unpack batch cho mô hình V2
+            # UNPACK RAW TEXT
             video_feats = batch["video_feats"].to(device)
-            text_feats = batch["text_feats"].to(device) # Vẫn cần text_feats
+            text_feats = batch["text_feats"].to(device)
             labels = batch["labels"].to(device)
-            questions = batch["questions"]       # MỚI: list[str]
-            choice_texts = batch["choice_texts"] # MỚI: list[list[str]]
+            questions = batch["questions"]       # Raw strings
+            choice_texts = batch["choice_texts"] # Raw list[strings]
 
             with autocast(enabled=USE_FP16):
-                # THAY ĐỔI: Truyền input mới cho model
+                # Truyền raw text cho model
                 logits = model(video_feats, text_feats, questions, choice_texts)
                 loss = loss_fn(logits, labels)
 
@@ -97,21 +97,29 @@ def train_loop():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --------------------------
-    # MỚI: Load Tokenizer (thay vì text_encoder)
+    # Load Encoders/Tokenizers
     # --------------------------
-    print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    print("Loading LLM tokenizer...")
+    # Tokenizer cho LLM (Mistral)
+    llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+    if llm_tokenizer.pad_token is None:
+        llm_tokenizer.pad_token = llm_tokenizer.eos_token
     
+    # MPNet Encoder (dùng để tạo text_feats trong dataset)
+    print("Loading MPNet text encoder (dùng cho dataset)...")
+    mpnet_encoder = load_text_encoder(device="cpu") # Chuyển về CPU để tránh chiếm VRAM LLM
+
+    # --------------------------
+    # Load dataset
+    # --------------------------
     print("Loading dataset...")
-    full_ds = FeatureVideoQADatasetMPNET( # GIẢ SỬ file này đã được sửa
+    # ❗ KHÔNG TRUYỀN 'tokenizer' Ở ĐÂY ❗
+    full_ds = FeatureVideoQADatasetMPNET( 
         json_path=DATA_JSON,
         video_feat_dir=VIDEO_FEAT_DIR,
         video_feat_dim=VIDEO_FEAT_DIM,
-        # text_encoder bị xóa
-        tokenizer=tokenizer, # MỚI: Truyền tokenizer vào dataset
-        preload_text=True, # Giả sử bạn vẫn preload text_feats
+        text_encoder=mpnet_encoder, # CHỈ TRUYỀN MPNet ENCODER
+        preload_text=True, 
         is_test=False
     )
 
@@ -126,9 +134,9 @@ def train_loop():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=BATCH_SIZE, # Đã cập nhật
+        batch_size=BATCH_SIZE, 
         shuffle=True,
-        collate_fn=collate_fn_mpnet, # GIẢ SỬ file này đã được sửa
+        collate_fn=collate_fn_mpnet, 
         num_workers=NUM_WORKERS,
         pin_memory=True 
     )
@@ -136,34 +144,27 @@ def train_loop():
         val_ds,
         batch_size=BATCH_SIZE * 2,
         shuffle=False,
-        collate_fn=collate_fn_mpnet, # GIẢ SỬ file này đã được sửa
+        collate_fn=collate_fn_mpnet, 
         num_workers=NUM_WORKERS,
         pin_memory=True
     )
 
     # --------------------------
-    # Build model (THAY ĐỔI)
+    # Build model 
     # --------------------------
     print("Building model (V2)...")
     model = VideoTextLLMQA_V2(
         video_dim=VIDEO_FEAT_DIM,
-        text_dim=TEXT_FEAT_DIM, # Dim của text_feats (MPNet/CLIP)
+        text_dim=TEXT_FEAT_DIM,
         hidden_dim=512,
-        llm_model_name=LLM_MODEL_NAME, # Đã là Mistral
+        llm_model_name=LLM_MODEL_NAME, 
         device=device
-        # Model V2 tự xử lý device_map và PEFT bên trong
     )
 
-    # Tạm thời tắt torch.compile, nó có thể không tương thích tốt với PEFT/HF
-    # if hasattr(torch, 'compile'):
-    #     print("Compiling model (PyTorch 2.0+)...")
-    #     model = torch.compile(model)
-
     # --------------------------
-    # Optimizer (THAY ĐỔI LỚN)
+    # Optimizer (PEFT)
     # --------------------------
     print("Setting up PEFT optimizer...")
-    # MỚI: Chỉ lấy các tham số có thể huấn luyện (LoRA, projections, v.v.)
     trainable_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -171,7 +172,7 @@ def train_loop():
             print(f"Adding trainable param: {name}")
 
     optimizer = torch.optim.AdamW(
-        trainable_params, # THAY ĐỔI: Chỉ truyền các params này
+        trainable_params, 
         lr=LR,
         weight_decay=WEIGHT_DECAY
     )
@@ -190,8 +191,6 @@ def train_loop():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print(f"--- Starting PEFT training ---")
-    print(f"Device: {device}, FP16: {USE_FP16}, Effective BS: {BATCH_SIZE * ACCUM_STEPS}")
-    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     
     for epoch in range(EPOCHS):
         model.train()
@@ -201,15 +200,15 @@ def train_loop():
         optimizer.zero_grad() 
 
         for step, batch in enumerate(pbar):
-            # THAY ĐỔI: Unpack batch cho mô hình V2
+            # UNPACK RAW TEXT
             video_feats = batch["video_feats"].to(device)
             text_feats = batch["text_feats"].to(device)
             labels = batch["labels"].to(device)
-            questions = batch["questions"]       # MỚI
-            choice_texts = batch["choice_texts"] # MỚI
+            questions = batch["questions"]      # Raw strings
+            choice_texts = batch["choice_texts"]# Raw list[strings]
 
             with autocast(enabled=USE_FP16):
-                # THAY ĐỔI: Truyền input mới cho model
+                # Truyền raw text cho model
                 logits = model(video_feats, text_feats, questions, choice_texts)
                 loss = loss_fn(logits, labels)
                 loss_to_backward = loss / ACCUM_STEPS 
@@ -218,7 +217,6 @@ def train_loop():
 
             if (step + 1) % ACCUM_STEPS == 0:
                 scaler.unscale_(optimizer)
-                # THAY ĐỔI: Clip grad norm chỉ cho các tham số huấn luyện
                 torch.nn.utils.clip_grad_norm_(trainable_params, CLIP_NORM)
                 scaler.step(optimizer)
                 scaler.update()
@@ -236,17 +234,15 @@ def train_loop():
         scheduler.step(val_loss)
 
         # --------------------------
-        # Save best (THAY ĐỔI LỚN)
+        # Save best
         # --------------------------
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
             
-            # THAY ĐỔI: Lưu adapter (PEFT)
             adapter_path = os.path.join(OUTPUT_DIR, "best_adapter")
-            model.save_pretrained(adapter_path) # Đây là cách lưu của PEFT
+            model.save_pretrained(adapter_path) 
             
-            # Lưu các thông tin khác
             meta_path = os.path.join(OUTPUT_DIR, "best_model_meta.json")
             with open(meta_path, 'w') as f:
                 json.dump({
