@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# Import các thư viện cần thiết, đặc biệt là BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import get_peft_model, LoraConfig, TaskType
-from typing import List # KHẮC PHỤC LỖI: Import List
+from typing import List 
 
 class VideoTextLLMQA_V2(nn.Module):
     def __init__(self,
@@ -13,7 +14,7 @@ class VideoTextLLMQA_V2(nn.Module):
                  num_layers=2,
                  num_video_tokens=4,
                  dropout=0.2,
-                 llm_model_name="mistralai/Mistral-7B-v0.1", # ĐÃ SỬA: Dùng Mistral 7B (Open Access)
+                 llm_model_name="mistralai/Mistral-7B-v0.1",
                  device="cuda"):
         super().__init__()
         self.device = device
@@ -64,14 +65,22 @@ class VideoTextLLMQA_V2(nn.Module):
         # LUỒNG 2: LLM (PEFT Injection)
         # ======================================================
 
+        # ❗ Cấu hình 4-bit Quantization để tiết kiệm VRAM ❗
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4", # Normal Float 4-bit
+            # Sử dụng bfloat16 nếu GPU hỗ trợ, nếu không thì dùng float16
+            bnb_4bit_compute_dtype=torch.bfloat16, 
+        )
+
         # Tải mô hình CausalLM và áp dụng LoRA
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_model_name, 
+            quantization_config=bnb_config, # Áp dụng quantization
             device_map="auto"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
         if self.tokenizer.pad_token is None:
-            # Mistral có pad_token là None, thường dùng eos_token làm pad_token
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Cấu hình và áp dụng LoRA
