@@ -15,7 +15,7 @@ from model import EarlyFusionMPNetQA
 #  CONFIG
 # =============================
 TEST_JSON = "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/public_test/public_test.json"
-VIDEO_FEAT_DIR = "/kaggle/input/public-test-video" # folder chứa .pt video test
+VIDEO_FEAT_DIR = "Feature/public_test" # folder chứa .pt video test
 
 # ❗ ĐỒNG BỘ: Phải khớp với script train
 VIDEO_FEAT_DIM = 2304 
