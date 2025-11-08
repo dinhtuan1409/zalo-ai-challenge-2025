@@ -25,7 +25,7 @@ DATA_JSON = "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+
 VIDEO_FEAT_DIR = "Feature/train"
 
 # --- Config cho mô hình V2 ---
-LLM_MODEL_NAME = "meta-llama/Llama-2-7b-hf" # MỚI: Tên model LLM
+LLM_MODEL_NAME = "mistralai/Mistral-7B-v0.1" # ĐÃ SỬA: Dùng Mistral 7B (Open Access)
 VIDEO_FEAT_DIM = 2304 
 TEXT_FEAT_DIM = 768 # Giữ nguyên dim của text_feats (MPNet/CLIP)
 
@@ -33,7 +33,7 @@ TEXT_FEAT_DIM = 768 # Giữ nguyên dim của text_feats (MPNet/CLIP)
 BATCH_SIZE = 4        # THAY ĐỔI: Giảm BS vì LLM tốn VRAM
 ACCUM_STEPS = 4       # THAY ĐỔI: Tăng ACCUM (Effective BS = 4*4 = 16)
 LR = 1e-4             # THAY ĐỔI: Learning rate phổ biến cho LoRA
-EPOCHS = 20           # Giảm epochs, vì LLM hội tụ nhanh hơn
+EPOCHS = 10           # Giảm epochs, vì LLM hội tụ nhanh hơn
 WEIGHT_DECAY = 0.01
 VALID_SPLIT = 0.1
 OUTPUT_DIR = "/kaggle/working/"
@@ -149,7 +149,7 @@ def train_loop():
         video_dim=VIDEO_FEAT_DIM,
         text_dim=TEXT_FEAT_DIM, # Dim của text_feats (MPNet/CLIP)
         hidden_dim=512,
-        llm_model_name=LLM_MODEL_NAME,
+        llm_model_name=LLM_MODEL_NAME, # Đã là Mistral
         device=device
         # Model V2 tự xử lý device_map và PEFT bên trong
     )
