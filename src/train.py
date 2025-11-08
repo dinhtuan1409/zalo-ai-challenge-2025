@@ -30,8 +30,9 @@ VIDEO_FEAT_DIM = 2304
 TEXT_FEAT_DIM = 768 # MPNet dim
 
 # --- Config huấn luyện (Điều chỉnh cho PEFT) ---
-BATCH_SIZE = 4        
-ACCUM_STEPS = 4       
+# ❗ ĐÃ GIẢM BATCH_SIZE (4 -> 2) VÀ TĂNG ACCUM_STEPS (4 -> 8) ĐỂ KHẮC PHỤC LỖI OOM ❗
+BATCH_SIZE = 2        
+ACCUM_STEPS = 8       
 LR = 1e-4             
 EPOCHS = 10           
 WEIGHT_DECAY = 0.01
