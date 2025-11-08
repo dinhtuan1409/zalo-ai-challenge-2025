@@ -33,7 +33,7 @@ TEXT_FEAT_DIM = 768 # Giữ nguyên dim của text_feats (MPNet/CLIP)
 BATCH_SIZE = 4        # THAY ĐỔI: Giảm BS vì LLM tốn VRAM
 ACCUM_STEPS = 4       # THAY ĐỔI: Tăng ACCUM (Effective BS = 4*4 = 16)
 LR = 1e-4             # THAY ĐỔI: Learning rate phổ biến cho LoRA
-EPOCHS = 10           # Giảm epochs, vì LLM hội tụ nhanh hơn
+EPOCHS = 20           # Giảm epochs, vì LLM hội tụ nhanh hơn
 WEIGHT_DECAY = 0.01
 VALID_SPLIT = 0.1
 OUTPUT_DIR = "/kaggle/working/"

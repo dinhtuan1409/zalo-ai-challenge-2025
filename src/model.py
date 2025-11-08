@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
 from peft import get_peft_model, LoraConfig, TaskType # MỚI: Cần thư viện PEFT
-
+from typing import List
 class VideoTextLLMQA_V2(nn.Module):
     def __init__(self,
                  video_dim=2304,
