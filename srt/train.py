@@ -17,7 +17,7 @@ from model import EarlyFusionMPNetQA
 # CONFIG
 # ===========================
 DATA_JSON = "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/train/train.json"
-VIDEO_FEAT_DIR = "/kaggle/input/feature-video-zalo/train"
+VIDEO_FEAT_DIR = "Feature/train"
 
 # ❗ SỬA LỖI: Đồng bộ video_dim ở đây
 VIDEO_FEAT_DIM = 2304 # Cần khớp với feature của bạn (dataset đang là 2304)
