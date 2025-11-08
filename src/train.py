@@ -10,7 +10,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 # --- Import các file code của bạn ---
 # (Giả sử chúng nằm trong các file .py tương ứng)
-from dataset_mpnet import FeatureVideoQADatasetMPNET, collate_fn_mpnet, load_text_encoder
+from dataset import FeatureVideoQADatasetMPNET, collate_fn_mpnet, load_text_encoder
 from model import EarlyFusionMPNetQA 
 
 # ===========================
