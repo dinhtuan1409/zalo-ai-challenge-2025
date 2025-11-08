@@ -160,6 +160,9 @@ def train_loop():
         llm_model_name=LLM_MODEL_NAME, 
         device=device
     )
+    # ❗ KHẮC PHỤC LỖI DEVICE: Di chuyển toàn bộ mô hình sang CUDA
+    model = model.to(device)
+
 
     # --------------------------
     # Optimizer (PEFT)
