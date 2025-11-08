@@ -5,26 +5,26 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.cuda.amp import autocast
+from peft import PeftModel # ❗ CẦN THIẾT cho việc tải LoRA adapter
 
 # --- Import các file code của bạn ---
-# (Giả sử chúng nằm trong các file .py tương ứng)
 from dataset import FeatureVideoQADatasetMPNET, collate_fn_mpnet, load_text_encoder
-from model import ContextTransformerQAModel 
+# Sử dụng tên class mới đã được PEFT hóa
+from model import VideoTextLLMQA_V2 
 
 # =============================
-#  CONFIG
+# CONFIG
 # =============================
 TEST_JSON = "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/public_test/public_test.json"
-VIDEO_FEAT_DIR = "Feature/public_test" # folder chứa .pt video test
+VIDEO_FEAT_DIR = "Feature/public_test" 
 
-# ❗ ĐỒNG BỘ: Phải khớp với script train
 VIDEO_FEAT_DIM = 2304 
 
-# ❗ ĐỒNG BỘ: Phải khớp với nơi script train lưu model
-CHECKPOINT = "/kaggle/working/best_model.pt" 
+# ❗ SỬA LỖI: Điểm checkpoint là thư mục adapter, không phải file .pt
+CHECKPOINT = "/kaggle/working/best_adapter" 
 
 OUTPUT_FILE = "/kaggle/working/submission.json"
-BATCH_SIZE = 32 # Có thể tăng BATCH_SIZE khi inference
+BATCH_SIZE = 32 
 NUM_WORKERS = os.cpu_count()
 USE_FP16 = True
 # =============================
@@ -33,28 +33,32 @@ USE_FP16 = True
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # -----------------------------------
-# Load text encoder (giống train)
+# Load text encoder
 # -----------------------------------
 print("🔄 Loading text encoder...")
 text_encoder = load_text_encoder(device)
 
 # -----------------------------------
-# Load model
+# Load model & Adapter (QUAN TRỌNG)
 # -----------------------------------
-print("🔄 Loading model...")
-model = ContextTransformerQAModel(
-    video_dim=VIDEO_FEAT_DIM, # ❗ ĐỒNG BỘ: Dùng 2304
-    text_dim=768
-).to(device)
+print("🔄 Building model (VideoTextLLMQA_V2)...")
+model = VideoTextLLMQA_V2(
+    video_dim=VIDEO_FEAT_DIM, 
+    text_dim=768,
+    hidden_dim=512,
+    device=device
+).to(device) # Chuyển các lớp fusion sang GPU
 
-# 💡 TỐI ƯU: (PyTorch 2.0+) Tăng tốc model
-if hasattr(torch, 'compile'):
-    print("Compiling model (PyTorch 2.0+)...")
-    model = torch.compile(model)
+# ❗ BƯỚC SỬA LỖI CHÍNH: Tải adapter LoRA vào submodule LLM ❗
+if os.path.exists(CHECKPOINT):
+    print(f"Loading LoRA adapter from {CHECKPOINT}...")
+    # Tải adapter LoRA vào self.llm (là mô hình Mistral 7B đã được lượng tử hóa)
+    model.llm = PeftModel.from_pretrained(model.llm, CHECKPOINT)
+    print("✅ Adapter loaded successfully.")
+else:
+    raise FileNotFoundError(f"Adapter checkpoint not found at {CHECKPOINT}. Did training complete?")
 
-print(f"Loading checkpoint from {CHECKPOINT}...")
-ckpt = torch.load(CHECKPOINT, map_location=device)
-model.load_state_dict(ckpt["model"], strict=True) # Dùng strict=True để đảm bảo
+
 model.eval()
 
 # -----------------------------------
@@ -64,8 +68,8 @@ print("🔄 Loading test dataset...")
 test_ds = FeatureVideoQADatasetMPNET(
     json_path=TEST_JSON,
     video_feat_dir=VIDEO_FEAT_DIR,
-    video_feat_dim=VIDEO_FEAT_DIM, # ❗ ĐỒNG BỘ
-    text_encoder=text_encoder,     # ❗ ĐỒNG BỘ: Dùng text encoder đã load
+    video_feat_dim=VIDEO_FEAT_DIM, 
+    text_encoder=text_encoder, 
     preload_text=True,
     is_test=True
 )
@@ -75,7 +79,7 @@ test_loader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=False,
     collate_fn=collate_fn_mpnet,
-    num_workers=NUM_WORKERS, # 💡 TỐI ƯU
+    num_workers=NUM_WORKERS,
     pin_memory=True
 )
 
@@ -88,27 +92,29 @@ with torch.no_grad():
     pbar = tqdm(test_loader, desc="🚀 Inference")
     for batch in pbar:
 
-        video = batch["video_feats"].to(device)
-        text  = batch["text_feats"].to(device)
-        ids   = batch["ids"]
+        video_feats = batch["video_feats"].to(device)
+        text_feats = batch["text_feats"].to(device)
+        questions = batch["questions"]       
+        choice_texts = batch["choice_texts"] 
+        ids  = batch["ids"]
 
-        # 💡 TỐI ƯU: Dùng autocast
+        # Dùng autocast (FP16)
         with autocast(enabled=USE_FP16):
-            logits = model(video, text) # (B, C)
+            # Cần truyền đủ 4 đối số cho model V2
+            logits = model(video_feats, text_feats, questions, choice_texts) 
         
         preds = logits.argmax(dim=1).cpu().tolist()
 
         for qid, p in zip(ids, preds):
             results.append({
                 "id": qid,
-                "answer": int(p) # Submit index (0, 1, 2, 3...)
+                "answer": int(p) 
             })
 
 # -----------------------------------
 # Save submission
 # -----------------------------------
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-    # Định dạng output chuẩn cho Zalo: {"data": [...]}
     output_data = {"data": results}
     json.dump(output_data, f, ensure_ascii=False, indent=2)
 
