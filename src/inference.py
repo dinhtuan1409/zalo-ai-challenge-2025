@@ -8,8 +8,8 @@ from torch.cuda.amp import autocast
 
 # --- Import các file code của bạn ---
 # (Giả sử chúng nằm trong các file .py tương ứng)
-from dataset_mpnet import FeatureVideoQADatasetMPNET, collate_fn_mpnet, load_text_encoder
-from model import EarlyFusionMPNetQA 
+from dataset import FeatureVideoQADatasetMPNET, collate_fn_mpnet, load_text_encoder
+from model import ContextTransformerQAModel 
 
 # =============================
 #  CONFIG
@@ -42,7 +42,7 @@ text_encoder = load_text_encoder(device)
 # Load model
 # -----------------------------------
 print("🔄 Loading model...")
-model = EarlyFusionMPNetQA(
+model = ContextTransformerQAModel(
     video_dim=VIDEO_FEAT_DIM, # ❗ ĐỒNG BỘ: Dùng 2304
     text_dim=768
 ).to(device)
