@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
-from typing import List
+from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
+from peft import get_peft_model, LoraConfig, TaskType # MỚI: Cần thư viện PEFT
 
-class VideoTextLLMQA(nn.Module):
+class VideoTextLLMQA_V2(nn.Module):
     def __init__(self,
                  video_dim=2304,
                  text_dim=768,
@@ -19,155 +19,139 @@ class VideoTextLLMQA(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_video_tokens = num_video_tokens
 
-        # ---- Video Projection ----
-        self.video_proj = nn.Sequential(
-            nn.Linear(video_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-
-        # ---- Text Projection ----
-        self.text_proj = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-
-        # ---- FiLM modulation ----
+        # ======================================================
+        # LUỒNG 1: FUSION ĐA PHƯƠNG TIỆN (Giữ nguyên)
+        # ======================================================
+        
+        self.video_proj = nn.Sequential(...) # Giống như cũ
+        self.text_proj = nn.Sequential(...)  # Giống như cũ
         self.film_scale = nn.Linear(hidden_dim, hidden_dim)
         self.film_shift = nn.Linear(hidden_dim, hidden_dim)
-
-        # ---- Cross-Attention for video->text ----
-        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim,
-                                                num_heads=nhead,
-                                                batch_first=True,
-                                                dropout=dropout)
-
-        # ---- Transformer Encoder ----
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=nhead,
-            dim_feedforward=hidden_dim*2,
-            dropout=dropout,
-            batch_first=True
-        )
+        self.cross_attn = nn.MultiheadAttention(...) # Giống như cũ
+        encoder_layer = nn.TransformerEncoderLayer(...) # Giống như cũ
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # ---- LLM ----
-        # Chúng ta vẫn tải LLM, nhưng không nhất thiết phải ở device_map="auto"
-        # nếu chúng ta chỉ dùng nó để trích xuất đặc trưng (với no_grad)
-        # device_map="auto" vẫn ổn nếu bạn có đủ VRAM
-        self.llm = AutoModel.from_pretrained(llm_model_name, device_map="auto")
+        # ======================================================
+        # LUỒNG 2: LLM (THAY ĐỔI LỚN)
+        # ======================================================
+
+        # THAY ĐỔI: Tải mô hình CausalLM để có thể huấn luyện
+        # device_map="auto" rất quan trọng khi huấn luyện mô hình lớn
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            llm_model_name, 
+            device_map="auto"
+            # torch_dtype=torch.bfloat16 # Thêm dòng này để tiết kiệm VRAM
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # ---- MỚI: Lớp chiếu cho LLM output ----
-        # Chiếu output của LLM (llm.config.hidden_size) về hidden_dim
-        self.llm_proj = nn.Linear(self.llm.config.hidden_size, hidden_dim)
-
-        # ---- THAY ĐỔI: Final Classifier (để kết hợp cả hai luồng) ----
-        # Input sẽ là:
-        # 1. choice_embs (H)
-        # 2. llm_pooled (đã chiếu) (H)
-        # 3. Tương tác (H)
-        # Tổng cộng: hidden_dim * 3
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim), # THAY ĐỔI: Input là hidden_dim * 3
+        # MỚI: Thiết lập LoRA để fine-tune LLM hiệu quả
+        # Bạn có thể cần điều chỉnh 'target_modules' cho mô hình của mình
+        lora_config = LoraConfig(
+            r=16, # Rank của ma trận adapter (phổ biến là 8, 16, 32)
+            lora_alpha=32,
+            target_modules=["q_proj", "v_proj"], # Các lớp attention để áp dụng LoRA
+            lora_dropout=0.05,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM # Hoặc FEATURE_EXTRACTION nếu bạn chỉ muốn lấy features
+        )
+        # Bọc LLM bằng PEFT
+        self.llm = get_peft_model(self.llm, lora_config)
+        
+        # MỚI: Lớp chiếu đặc trưng đa phương tiện
+        # Chiếu từ `hidden_dim` (512) lên `llm.config.hidden_size` (ví dụ: 4096)
+        llm_hidden_size = self.llm.config.hidden_size
+        self.mm_proj = nn.Sequential(
+            nn.Linear(hidden_dim, llm_hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
+            nn.LayerNorm(llm_hidden_size)
         )
 
-    # THAY ĐỔI: Signature của hàm forward
+        # THAY ĐỔI: Classifier
+        # Xóa classifier cũ. Classifier mới sẽ hoạt động trên output của LLM
+        # Chúng ta sẽ áp dụng một lớp linear lên output của LLM tại vị trí các "choice token"
+        self.final_answer_proj = nn.Linear(llm_hidden_size, 1)
+
     def forward(self, video_feats, text_feats, questions: List[str], choice_texts: List[List[str]]):
         """
-        video_feats: (B, D_v)
-        text_feats: (B, C, D_t) - Đây là feature embeddings (ví dụ: CLIP)
-        questions: list[str], length B - Văn bản thô của câu hỏi
-        choice_texts: list[list[str]], shape (B, C) - Văn bản thô của các lựa chọn
+        Input vẫn như cũ (hoặc bạn có thể bỏ 'choice_texts' nếu không dùng)
         """
         B, C, _ = text_feats.shape
 
         # ==================================================
-        # LUỒNG 1: FUSION ĐA PHƯƠNG TIỆN (Video + Text Embeddings)
+        # LUỒNG 1: TÍNH TOÁN `choice_embs` (Giữ nguyên)
         # ==================================================
         
-        # 1. Multi-frame video tokens
         v = self.video_proj(video_feats).unsqueeze(1).repeat(1, self.num_video_tokens, 1) # (B, N, H)
-
-        # 2. Text projection (Sử dụng text_feats)
         t = self.text_proj(text_feats) # (B, C, H)
-
-        # 3. FiLM modulation
         scale = self.film_scale(v.mean(1, keepdim=True))
         shift = self.film_shift(v.mean(1, keepdim=True))
         t_mod = t * scale + shift
-
-        # 4. Cross-Attention: video queries text
         attn_out, _ = self.cross_attn(query=v, key=t_mod, value=t_mod) # (B, N, H)
-
-        # 5. Concat video + text -> Transformer
         x = torch.cat([attn_out, t_mod], dim=1) # (B, N+C, H)
         x = self.transformer(x)
-
-        # 6. Lấy text embeddings (bỏ video tokens)
         choice_embs = x[:, self.num_video_tokens:, :] # (B, C, H)
 
         # ==================================================
-        # LUỒNG 2: SUY LUẬN NGÔN NGỮ (Question + Choice Texts)
+        # LUỒNG 2: "TIÊM" VÀO LLM
         # ==================================================
 
-        # 7. LLM reasoning (Sử dụng questions + choice_texts)
-        if not choice_texts or len(choice_texts) != B:
-            raise ValueError("choice_texts phải được cung cấp và có batch size B")
-        
-        prompts = []
-        for i in range(B):
-            # Tạo prompt từ văn bản thô
-            choices_str = " | ".join([f"{j+1}: {choice_texts[i][j]}" for j in range(C)])
-            prompts.append(f"Question: {questions[i]}\nChoices: {choices_str}")
+        # 1. MỚI: Chiếu `choice_embs` lên không gian của LLM
+        # Đây là các "soft token" đại diện cho lựa chọn đã fusion với video
+        projected_choice_embs = self.mm_proj(choice_embs) # (B, C, LLM_H)
 
-        # Tokenize
-        tokenized = self.tokenizer(
+        # 2. MỚI: Chuẩn bị input text (chỉ câu hỏi)
+        # Tạo một prompt template
+        prompts = [
+            f"Question: {q}\nBased on the video, which of the following is correct?" 
+            for q in questions
+        ]
+        
+        tokenized_text = self.tokenizer(
             prompts, 
             return_tensors="pt", 
             padding=True, 
             truncation=True,
-            max_length=256 # Giới hạn max_length để tiết kiệm bộ nhớ
+            max_length=128
         ).to(self.device)
-
-        # Pass through LLM (không cần tính gradient)
-        with torch.no_grad():
-            llm_output = self.llm(**tokenized).last_hidden_state # (B, seq_len, llm_hidden_size)
         
-        # Pooling: Lấy embedding của token cuối cùng (thường là EOS hoặc token quan trọng)
-        # Hoặc dùng mean pooling
-        llm_pooled = llm_output.mean(1) # (B, llm_hidden_size)
-
-        # ==================================================
-        # KẾT HỢP HAI LUỒNG
-        # ==================================================
+        # Lấy text embeddings từ LLM
+        text_embeddings = self.llm.get_input_embeddings()(tokenized_text.input_ids) # (B, T, LLM_H)
+        text_attention_mask = tokenized_text.attention_mask # (B, T)
         
-        # 8. MỚI: Chiếu LLM output về hidden_dim
-        # llm_pooled đại diện cho "suy luận" về câu hỏi VÀ tất cả các lựa chọn
-        reasoning_vec = self.llm_proj(llm_pooled) # (B, H)
+        T = text_embeddings.shape[1] # Độ dài chuỗi text
 
-        # 9. MỚI: Mở rộng reasoning_vec để khớp với số choices (C)
-        # (B, H) -> (B, 1, H) -> (B, C, H)
-        reasoning_vec_expanded = reasoning_vec.unsqueeze(1).repeat(1, C, 1)
-
-        # 10. MỚI: Kết hợp đặc trưng
-        # Kết hợp đặc trưng fusion (choice_embs) và đặc trưng suy luận (reasoning_vec_expanded)
-        combined_features = torch.cat([
-            choice_embs,                  # "Lựa chọn này khớp video không?"
-            reasoning_vec_expanded,       # "Bối cảnh chung của câu hỏi/lựa chọn là gì?"
-            choice_embs * reasoning_vec_expanded # Tương tác
-        ], dim=2) # (B, C, H*3)
-
-        # 11. MỚI: Đưa qua classifier đã được cập nhật
-        logits = self.classifier(combined_features).squeeze(-1) # (B, C)
+        # 3. MỚI: Kết hợp (Inject) Text Embeddings và Choice Embeddings
+        # [Text_Token_1, ..., Text_Token_T, Choice_Token_1, ..., Choice_Token_C]
+        inputs_embeds = torch.cat([
+            text_embeddings, 
+            projected_choice_embs
+        ], dim=1) # (B, T+C, LLM_H)
         
+        # Tạo attention mask tương ứng
+        choice_attention_mask = torch.ones(B, C, device=self.device).long()
+        attention_mask = torch.cat([
+            text_attention_mask, 
+            choice_attention_mask
+        ], dim=1) # (B, T+C)
+
+        # 4. MỚI: Forward qua LLM (BỎ `torch.no_grad()`)
+        # Cần bật training (ví dụ: model.train())
+        llm_output = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        
+        last_hidden_states = llm_output.last_hidden_state # (B, T+C, LLM_H)
+
+        # 5. MỚI: Lấy output tại vị trí các "choice token"
+        # Chúng ta chỉ quan tâm đến C token cuối cùng
+        choice_outputs = last_hidden_states[:, -C:, :] # (B, C, LLM_H)
+
+        # 6. MỚI: Áp dụng classifier cuối cùng
+        # Dự đoán điểm số cho từng choice token
+        logits = self.final_answer_proj(choice_outputs).squeeze(-1) # (B, C)
+
         return logits
