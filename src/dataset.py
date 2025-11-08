@@ -33,18 +33,20 @@ def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
 
 # ===========================================================
 # ✅ DATASET – Video feature (.pt) + Text MPNet encode
+# *BỔ SUNG RAW TEXT*
 # ===========================================================
 
 class FeatureVideoQADatasetMPNET(Dataset):
     """
     Video: load từ .pt (shape: D_video)
     Text: encode trực tiếp bằng MPNet (shape: num_choices x 768)
+    Bổ sung: Raw question và choices (dùng cho LLM)
     """
 
     def __init__(self, 
                  json_path: str, 
                  video_feat_dir: str,
-                 video_feat_dim: int = 2304,  # <-- Thêm tham số này
+                 video_feat_dim: int = 2304,
                  text_encoder: Optional[SentenceTransformer] = None,
                  preload_text: bool = True,
                  is_test: bool = False):
@@ -55,11 +57,12 @@ class FeatureVideoQADatasetMPNET(Dataset):
             self.items = json.load(f)["data"]
 
         self.video_feat_dir = video_feat_dir
-        self.video_feat_dim = video_feat_dim  # <-- Lưu lại kích thước
+        self.video_feat_dim = video_feat_dim
         self.is_test = is_test
 
-        # text encoder
+        # text encoder (MPNet)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # ❗ LƯU Ý: Vẫn cần MPNet encoder để tạo ra text_feats cho Fusion Module
         self.text_encoder = text_encoder if text_encoder else load_text_encoder(self.device)
 
         # ✅ Preload text → encode 1 lần (khuyên dùng)
@@ -117,10 +120,15 @@ class FeatureVideoQADatasetMPNET(Dataset):
 
     # -------------------------------------------------------
     # ✅ GET ITEM
+    # *BỔ SUNG RAW TEXT*
     # -------------------------------------------------------
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
         qid = item["id"]
+        
+        # Lấy text thô (MỚI)
+        question = item["question"]
+        choice_texts = item["choices"]
 
         # 1️⃣ Video feature
         vid = os.path.splitext(os.path.basename(item["video_path"]))[0]
@@ -129,17 +137,14 @@ class FeatureVideoQADatasetMPNET(Dataset):
         if os.path.exists(feat_path):
             video_feat = torch.load(feat_path).float()
         else:
-            # ❗ SỬA LỖI: Dùng kích thước 2304 theo yêu cầu của bạn
             video_feat = torch.zeros(self.video_feat_dim)
 
-        # 2️⃣ Text feature
+        # 2️⃣ Text feature (MPNet embeddings)
         if self.preload_text:
             text_feats = self.text_cache[qid]
         else:
             # Chế độ on-the-fly (rất chậm)
-            question = item["question"]
-            choices = item["choices"]
-            texts = [question + " [SEP] " + c for c in choices]
+            texts = [question + " [SEP] " + c for c in choice_texts]
             text_feats = self.encode_text(texts)
 
         # 3️⃣ Label
@@ -147,40 +152,45 @@ class FeatureVideoQADatasetMPNET(Dataset):
         if not self.is_test:
             ans = item.get("answer")
             if ans:
-                for i, c in enumerate(item["choices"]):
+                for i, c in enumerate(choice_texts): # Dùng choice_texts
                     if ans.strip() == c.strip():
                         label = i
                         break
 
-        # 4️⃣ Return
-        if self.is_test:
-            return {
-                "id": qid,
-                "video_feat": video_feat,
-                "text_feats": text_feats
-            }
-
-        return {
+        # 4️⃣ Return (BỔ SUNG RAW TEXT)
+        base_return = {
             "id": qid,
             "video_feat": video_feat,
             "text_feats": text_feats,
-            "label": label
+            "question": question,         # MỚI: Text thô
+            "choice_texts": choice_texts, # MỚI: List of strings thô
         }
+
+        if not self.is_test:
+            base_return["label"] = label
+        
+        return base_return
 
 
 # ===========================================================
 # ✅ COLLATE FN (PAD CHOICE)
+# *XỬ LÝ RAW TEXT*
 # ===========================================================
 
 def collate_fn_mpnet(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Hàm Collate tùy chỉnh để pad text_feats (do số lượng choices có thể khác nhau).
+    Hàm Collate tùy chỉnh:
+    1. Pad text_feats (tensor MPNet)
+    2. Gộp raw text (strings) thành list
     """
     
     # Tìm số lượng choices tối đa trong batch này
     max_choice = max(b["text_feats"].shape[0] for b in batch)
 
     ids, video_feats, text_feats, labels = [], [], [], []
+    # MỚI: Lưu trữ raw text
+    questions: List[str] = []
+    raw_choice_texts: List[List[str]] = []
 
     has_labels = "label" in batch[0]
 
@@ -188,7 +198,11 @@ def collate_fn_mpnet(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         ids.append(b["id"])
         video_feats.append(b["video_feat"])
 
-        # Xử lý padding cho text_feats
+        # MỚI: Lấy raw text (chỉ append list/string, KHÔNG STACK)
+        questions.append(b["question"])
+        raw_choice_texts.append(b["choice_texts"])
+
+        # Xử lý padding cho text_feats (tensor MPNet embeddings)
         tf = b["text_feats"]
         num_c, dim = tf.shape
 
@@ -202,10 +216,13 @@ def collate_fn_mpnet(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if has_labels:
             labels.append(b["label"])
 
-    # Stack tất cả lại thành batch
+    # Stack tensors và trả về raw text
     return {
         "ids": ids,
         "video_feats": torch.stack(video_feats).float(),
         "text_feats": torch.stack(text_feats).float(),
-        "labels": torch.tensor(labels, dtype=torch.long) if has_labels else None
+        "labels": torch.tensor(labels, dtype=torch.long) if has_labels else None,
+        # MỚI: Trả về list text thô
+        "questions": questions,
+        "choice_texts": raw_choice_texts,
     }
