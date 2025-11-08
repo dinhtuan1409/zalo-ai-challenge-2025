@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-# Import BitsAndBytesConfig cho lượng tử hóa 4-bit
+# Thư viện cần thiết cho 4-bit quantization
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import get_peft_model, LoraConfig, TaskType
 from typing import List 
@@ -60,24 +60,24 @@ class VideoTextLLMQA_V2(nn.Module):
         # LUỒNG 2: LLM (PEFT Injection)
         # ======================================================
 
-        # ❗ Cấu hình 4-bit Quantization để tiết kiệm VRAM ❗
+        # 1. Cấu hình 4-bit Quantization (Khắc phục OOM)
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4", 
             bnb_4bit_compute_dtype=torch.bfloat16, 
         )
 
-        # Tải mô hình CausalLM: Dùng device_map={"": 0} để buộc LLM vào CUDAS 0
+        # 2. Tải mô hình CausalLM (Khắc phục lỗi Device Mismatch)
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_model_name, 
             quantization_config=bnb_config, 
-            device_map={"": 0} # ❗ SỬA LỖI DEVICE/MULTI-GPU TẠI ĐÂY ❗
+            device_map={"": 0} # Buộc LLM tải vào GPU 0
         )
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Cấu hình và áp dụng LoRA
+        # 3. Cấu hình và áp dụng LoRA
         lora_config = LoraConfig(
             r=16, 
             lora_alpha=32,
@@ -88,7 +88,6 @@ class VideoTextLLMQA_V2(nn.Module):
         )
         self.llm = get_peft_model(self.llm, lora_config)
         
-        # Lớp chiếu đặc trưng đa phương tiện (từ H -> LLM_H)
         llm_hidden_size = self.llm.config.hidden_size
         self.mm_proj = nn.Sequential(
             nn.Linear(hidden_dim, llm_hidden_size),
@@ -96,7 +95,6 @@ class VideoTextLLMQA_V2(nn.Module):
             nn.LayerNorm(llm_hidden_size)
         )
 
-        # Classifier cuối cùng
         self.final_answer_proj = nn.Linear(llm_hidden_size, 1)
 
     def forward(self, video_feats, text_feats, questions: List[str], choice_texts: List[List[str]]):
@@ -107,14 +105,11 @@ class VideoTextLLMQA_V2(nn.Module):
         # ==================================================
         
         v = self.video_proj(video_feats).unsqueeze(1).repeat(1, self.num_video_tokens, 1) 
-
         t = self.text_proj(text_feats) 
         scale = self.film_scale(v.mean(1, keepdim=True))
         shift = self.film_shift(v.mean(1, keepdim=True))
         t_mod = t * scale + shift
-
         attn_out, _ = self.cross_attn(query=v, key=t_mod, value=t_mod) 
-
         x = torch.cat([attn_out, t_mod], dim=1) 
         x = self.transformer(x)
         choice_embs = x[:, self.num_video_tokens:, :] 
@@ -125,7 +120,7 @@ class VideoTextLLMQA_V2(nn.Module):
 
         projected_choice_embs = self.mm_proj(choice_embs) 
 
-        # 6. Chuẩn bị input text (Câu hỏi)
+        # Chuẩn bị input text (Câu hỏi)
         prompts = [
             f"Question: {q}\nBased on the video, which of the following is correct?" 
             for q in questions
@@ -153,16 +148,22 @@ class VideoTextLLMQA_V2(nn.Module):
             choice_attention_mask
         ], dim=1) 
 
+        # Forward qua LLM
         llm_output = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            return_dict=True
+            return_dict=True,
+            # THÊM output_hidden_states=True
+            output_hidden_states=True 
         )
         
-        last_hidden_states = llm_output.last_hidden_state 
+        # Lấy hidden state cuối cùng từ tuple 'hidden_states' (Khắc phục AttributeError)
+        last_hidden_states = llm_output.hidden_states[-1] 
 
+        # Lấy output tại vị trí các "choice token"
         choice_outputs = last_hidden_states[:, -C:, :] 
 
+        # Áp dụng classifier
         logits = self.final_answer_proj(choice_outputs).squeeze(-1) 
 
         return logits
