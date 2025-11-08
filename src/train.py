@@ -11,7 +11,7 @@ from torch.cuda.amp import autocast, GradScaler
 # --- Import các file code của bạn ---
 # (Giả sử chúng nằm trong các file .py tương ứng)
 from dataset import FeatureVideoQADatasetMPNET, collate_fn_mpnet, load_text_encoder
-from model import EarlyFusionMPNetQA 
+from model import ContextTransformerQAModel 
 
 # ===========================
 # CONFIG
@@ -145,7 +145,7 @@ def train_loop():
     # Build model
     # --------------------------
     print("Building model...")
-    model = EarlyFusionMPNetQA(
+    model = ContextTransformerQAModel(
         video_dim=VIDEO_FEAT_DIM, # ❗ SỬA LỖI: Dùng đúng video_dim
         text_dim=768,
         hidden_dim=512
