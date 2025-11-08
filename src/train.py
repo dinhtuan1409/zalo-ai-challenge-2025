@@ -8,14 +8,14 @@ import json
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
-from transformers import AutoTokenizer # Cần cho LLM
+from transformers import AutoTokenizer 
 
 # --- Import các file code của bạn ---
 from model import VideoTextLLMQA_V2 
 from dataset import (
     FeatureVideoQADatasetMPNET, 
     collate_fn_mpnet, 
-    load_text_encoder # Dùng lại hàm load MPNet từ dataset.py
+    load_text_encoder 
 )
 
 # ===========================
@@ -29,10 +29,9 @@ LLM_MODEL_NAME = "mistralai/Mistral-7B-v0.1"
 VIDEO_FEAT_DIM = 2304 
 TEXT_FEAT_DIM = 768 # MPNet dim
 
-# --- Config huấn luyện (Điều chỉnh cho PEFT) ---
-# ❗ ĐÃ GIẢM BATCH_SIZE (4 -> 2) VÀ TĂNG ACCUM_STEPS (4 -> 8) ĐỂ KHẮC PHỤC LỖI OOM ❗
-BATCH_SIZE = 2        
-ACCUM_STEPS = 8       
+# --- Config huấn luyện (Đã tối ưu cho OOM) ---
+BATCH_SIZE = 2        # Giảm để tiết kiệm VRAM
+ACCUM_STEPS = 8       # Tăng để giữ effective batch size
 LR = 1e-4             
 EPOCHS = 10           
 WEIGHT_DECAY = 0.01
@@ -70,11 +69,10 @@ def evaluate(model, loader, loss_fn, device):
             video_feats = batch["video_feats"].to(device)
             text_feats = batch["text_feats"].to(device)
             labels = batch["labels"].to(device)
-            questions = batch["questions"]       # Raw strings
-            choice_texts = batch["choice_texts"] # Raw list[strings]
+            questions = batch["questions"]       
+            choice_texts = batch["choice_texts"] 
 
             with autocast(enabled=USE_FP16):
-                # Truyền raw text cho model
                 logits = model(video_feats, text_feats, questions, choice_texts)
                 loss = loss_fn(logits, labels)
 
@@ -101,25 +99,22 @@ def train_loop():
     # Load Encoders/Tokenizers
     # --------------------------
     print("Loading LLM tokenizer...")
-    # Tokenizer cho LLM (Mistral)
     llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
     if llm_tokenizer.pad_token is None:
         llm_tokenizer.pad_token = llm_tokenizer.eos_token
     
-    # MPNet Encoder (dùng để tạo text_feats trong dataset)
     print("Loading MPNet text encoder (dùng cho dataset)...")
-    mpnet_encoder = load_text_encoder(device="cpu") # Chuyển về CPU để tránh chiếm VRAM LLM
+    mpnet_encoder = load_text_encoder(device="cpu") 
 
     # --------------------------
     # Load dataset
     # --------------------------
     print("Loading dataset...")
-    # ❗ KHÔNG TRUYỀN 'tokenizer' Ở ĐÂY ❗
     full_ds = FeatureVideoQADatasetMPNET( 
         json_path=DATA_JSON,
         video_feat_dir=VIDEO_FEAT_DIR,
         video_feat_dim=VIDEO_FEAT_DIM,
-        text_encoder=mpnet_encoder, # CHỈ TRUYỀN MPNet ENCODER
+        text_encoder=mpnet_encoder,
         preload_text=True, 
         is_test=False
     )
@@ -161,7 +156,7 @@ def train_loop():
         llm_model_name=LLM_MODEL_NAME, 
         device=device
     )
-    # ❗ KHẮC PHỤC LỖI DEVICE: Di chuyển toàn bộ mô hình sang CUDA
+    # Khắc phục lỗi Device Mismatch
     model = model.to(device)
 
 
@@ -208,11 +203,10 @@ def train_loop():
             video_feats = batch["video_feats"].to(device)
             text_feats = batch["text_feats"].to(device)
             labels = batch["labels"].to(device)
-            questions = batch["questions"]      # Raw strings
-            choice_texts = batch["choice_texts"]# Raw list[strings]
+            questions = batch["questions"]      
+            choice_texts = batch["choice_texts"]
 
             with autocast(enabled=USE_FP16):
-                # Truyền raw text cho model
                 logits = model(video_feats, text_feats, questions, choice_texts)
                 loss = loss_fn(logits, labels)
                 loss_to_backward = loss / ACCUM_STEPS 
@@ -245,7 +239,8 @@ def train_loop():
             epochs_no_improve = 0
             
             adapter_path = os.path.join(OUTPUT_DIR, "best_adapter")
-            model.save_pretrained(adapter_path) 
+            # ❗ KHẮC PHỤC LỖI: Gọi save_pretrained trên sub-module LLM ❗
+            model.llm.save_pretrained(adapter_path) 
             
             meta_path = os.path.join(OUTPUT_DIR, "best_model_meta.json")
             with open(meta_path, 'w') as f:
