@@ -148,7 +148,7 @@ def train_loop(args):
         shuffle=True,
         num_workers=args["num_workers"],
         pin_memory=True,
-        collate_fn=collate_fn_hme_mc
+        collate_fn=collate_fn_hme
     )
     val_loader = DataLoader(
         val_ds,
@@ -156,7 +156,7 @@ def train_loop(args):
         shuffle=False,
         num_workers=args["num_workers"],
         pin_memory=True,
-        collate_fn=collate_fn_hme_mc
+        collate_fn=collate_fn_hme
     )
 
     # --------------------------
