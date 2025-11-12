@@ -118,7 +118,7 @@ def train_loop(args):
     # Text encoder used by dataset (MPNet)
     # --------------------------
     print("Loading MPNet text encoder (for dataset preprocessing)...")
-    mpnet = load_text_encoder(device="cpu")  # dataset loads text on CPU and caches to CPU
+    mpnet = CLIPTextEncoder(device="cpu")  # dataset loads text on CPU and caches to CPU
 
     # --------------------------
     # Dataset & DataLoader
