@@ -1,4 +1,4 @@
-# dataset_hme.py
+# dataset_hme_v2.py
 import os
 import json
 import torch
@@ -6,9 +6,9 @@ from torch.utils.data import Dataset
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Optional
 
-# ===========================================================
-# ✅ Load Text Encoder
-# ===========================================================
+# -------------------------
+# Load Text Encoder
+# -------------------------
 def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2", trust_remote_code=True)
@@ -17,18 +17,10 @@ def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
     print(f"Text encoder loaded on {device}")
     return model
 
-
-# ===========================================================
-# ✅ Dataset for HME-VideoQA Multi-choice
-# ===========================================================
+# -------------------------
+# Dataset
+# -------------------------
 class FeatureVideoQAHME_MC(Dataset):
-    """
-    Dataset cho HME Multi-choice VideoQA
-      - Appearance feature: [B, 768] (saved per video ID)
-      - Motion feature: [B, T, 2304] (saved per video_path)
-      - Text feature: [B, C, 768] (MPNet embeddings)
-    """
-
     def __init__(
         self,
         json_path: str,
@@ -44,11 +36,10 @@ class FeatureVideoQAHME_MC(Dataset):
         self.feature_dir_appearance = feature_dir_appearance
         self.feature_dir_motion = feature_dir_motion
         self.is_test = is_test
-
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.text_encoder = text_encoder or load_text_encoder(self.device)
-
         self.preload_text = preload_text
+
         if preload_text:
             print("⚡ Pre-encoding all text (MPNet)...")
             self.text_cache = self._pre_encode_all_text()
@@ -84,27 +75,28 @@ class FeatureVideoQAHME_MC(Dataset):
         question = item["question"]
         choices = item["choices"]
 
-        # --- Appearance feature (per video ID) ---
+        # Appearance
         path_app = os.path.join(self.feature_dir_appearance, f"{qid}.pt")
         feat_app = torch.load(path_app).squeeze(0) if os.path.exists(path_app) else torch.zeros(768)
+        feat_app = feat_app.float().unsqueeze(0)  # [1, D]
 
-        # --- Motion feature (per video_path) ---
+        # Motion
         video_name = os.path.splitext(os.path.basename(item["video_path"]))[0]
         path_mot = os.path.join(self.feature_dir_motion, f"{video_name}.pt")
         if os.path.exists(path_mot):
-            feat_mot = torch.load(path_mot)           # [T, 2304]
+            feat_mot = torch.load(path_mot).float()  # [T, 2304]
         else:
             feat_mot = torch.zeros((1, 2304))
         motion_mask = torch.ones(feat_mot.shape[0], dtype=torch.long)
 
-        # --- Text feature ---
+        # Text
         if self.preload_text:
-            text_feats = self.text_cache[qid]          # [C, 768]
+            text_feats = self.text_cache[qid]  # [C, 768]
         else:
             texts = [question + " [SEP] " + c for c in choices]
             text_feats = self.encode_text(texts)
 
-        # --- Label ---
+        # Label
         label = -1
         if not self.is_test:
             ans = item.get("answer")
@@ -116,59 +108,53 @@ class FeatureVideoQAHME_MC(Dataset):
 
         return {
             "id": qid,
-            "appearance_feat": feat_app,       # [768]
-            "motion_feat": feat_mot,           # [T, 2304]
-            "motion_mask": motion_mask,        # [T]
-            "text_feats": text_feats,          # [C, 768]
+            "appearance_feats": feat_app,  # [1, 768]
+            "motion_feats": feat_mot,      # [T, 2304]
+            "motion_mask": motion_mask,    # [T]
+            "text_feats": text_feats,      # [C, 768]
             "question": question,
             "choice_texts": choices,
             "label": label
         }
 
-
-# ===========================================================
-# ✅ Collate function
-# ===========================================================
+# -------------------------
+# Collate
+# -------------------------
 def collate_fn_hme(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Collate for HME MC VideoQA
-      - Pads motion features to max T in batch
-      - Stacks appearance, text, labels
-    """
     batch_size = len(batch)
-    # --- Motion ---
-    max_T = max(b["motion_feat"].shape[0] for b in batch)
+    # Motion
+    max_T = max(b["motion_feats"].shape[0] for b in batch)
     motion_feats = torch.zeros((batch_size, max_T, 2304))
     motion_mask = torch.zeros((batch_size, max_T), dtype=torch.long)
     for i, b in enumerate(batch):
-        T_b = b["motion_feat"].shape[0]
-        motion_feats[i, :T_b] = b["motion_feat"]
+        T_b = b["motion_feats"].shape[0]
+        motion_feats[i, :T_b] = b["motion_feats"]
         motion_mask[i, :T_b] = b["motion_mask"]
 
-    # --- Appearance ---
-    appearance_feats = torch.stack([b["appearance_feat"] for b in batch], dim=0)  # [B, 768]
+    # Appearance
+    appearance_feats = torch.cat([b["appearance_feats"] for b in batch], dim=0)  # [B, 1, 768]
 
-    # --- Text ---
+    # Text
     max_C = max(b["text_feats"].shape[0] for b in batch)
     text_feats = torch.zeros((batch_size, max_C, 768))
     for i, b in enumerate(batch):
         C_b = b["text_feats"].shape[0]
         text_feats[i, :C_b] = b["text_feats"]
 
-    # --- Labels ---
+    # Labels
     labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
 
-    # --- Raw text ---
+    # Raw text
     questions = [b["question"] for b in batch]
     choice_texts = [b["choice_texts"] for b in batch]
     ids = [b["id"] for b in batch]
 
     return {
         "ids": ids,
-        "appearance_feats": appearance_feats,
-        "motion_feats": motion_feats,
-        "motion_mask": motion_mask,
-        "text_feats": text_feats,
+        "appearance_feats": appearance_feats,  # [B,1,768]
+        "motion_feats": motion_feats,          # [B,T,2304]
+        "motion_mask": motion_mask,            # [B,T]
+        "text_feats": text_feats,              # [B,C,768]
         "labels": labels,
         "questions": questions,
         "choice_texts": choice_texts

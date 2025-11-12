@@ -1,4 +1,4 @@
-# inference_hme_trainstyle.py
+# inference_hme_trainstyle_v2.py
 import os
 import json
 import torch
@@ -82,11 +82,10 @@ def inference_hme_trainstyle(
         for batch in pbar:
             motion_feats = batch["motion_feats"].to(device)       # [B, T, 2304]
             motion_mask = batch["motion_mask"].to(device)         # [B, T]
-            appearance_feats = batch["appearance_feats"].to(device)  # [B, 768]
+            appearance_feats = batch["appearance_feats"].to(device)  # [B, 1, 768]
             text_feats = batch["text_feats"].to(device)           # [B, C, 768]
             ids = batch["ids"]
 
-            # FP16 autocast
             with autocast(enabled=use_fp16):
                 out = model(
                     motion_feats=motion_feats,
