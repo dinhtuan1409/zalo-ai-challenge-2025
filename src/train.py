@@ -32,7 +32,7 @@ def get_default_args():
         "use_fp16": True,
         "earlystop_patience": 5,
         "num_workers": 4,
-        "clip_model_name": "openai/clip-vit-base-patch32",
+        "clip_model_name": "openai/clip-vit-large-patch14-336",
         "freeze_clip": True,
         "proj_dim": 768,
         "memory_size": 8,
