@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPModel, AutoTokenizer
 from typing import Optional
-
+from typing import Tuple, List
 def build_transformer_encoder(dim, num_layers=2, num_heads=8, dropout=0.1):
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=dim, nhead=num_heads, dim_feedforward=dim*4,
@@ -92,13 +92,33 @@ class HME_MC(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-    def encode_text(self, questions, answers):
-        # questions: [B], answers: [B, C]
-        B, C = answers.shape[0], answers.shape[1]
-        texts = [f"{q} {a}" for q in questions for a in answers[q]]
-        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=77).to(next(self.clip_model.parameters()).device)
+    def encode_text(self, questions: List[str], answers: List[List[str]]) -> torch.Tensor:
+        """
+        questions: List[str] -> [B]
+        answers:   List[List[str]] -> [B, C]
+        Returns:   [B*C, 768]
+        """
+        B = len(questions)
+        C = len(answers[0]) if B > 0 else 0  # Số lựa chọn (giả sử tất cả cùng C)
+
+        # Tạo list các cặp "question + answer"
+        texts = []
+        for q in questions:
+            for a in answers[questions.index(q)]:  # Dùng index để map đúng
+                texts.append(f"{q} {a}")
+
+        # Tokenize & encode bằng CLIP
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt"
+        ).to(next(self.clip_model.parameters()).device)
+
         with torch.no_grad():
             text_feats = self.clip_model.get_text_features(**inputs)  # [B*C, 768]
+
         return text_feats
 
     def forward(
