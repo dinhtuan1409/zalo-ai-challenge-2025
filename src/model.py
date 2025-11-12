@@ -1,196 +1,262 @@
-# model.py
+# train_optimized.py
+import os
+import random
+import json
+import argparse
+from typing import Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+
+from model import HME_MC
+from dataset import FeatureVideoQAHME_MC, load_text_encoder, collate_fn_hme
 
 # -------------------------
-# Utility: TransformerEncoder block (simple)
+# Default hyperparameters
 # -------------------------
-def build_transformer_encoder(dim, num_layers=2, num_heads=8, mlp_ratio=4.0, dropout=0.1):
-    encoder_layer = nn.TransformerEncoderLayer(
-        d_model=dim,
-        nhead=num_heads,
-        dim_feedforward=int(dim * mlp_ratio),
-        dropout=dropout,
-        activation="gelu",
-        batch_first=True,  # use (B, S, D)
+def get_default_args():
+    return {
+        "data_json": "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/train/train.json",
+        "feat_app_dir": "/kaggle/working/feature_motion_appeare/train_appear",
+        "feat_mot_dir": "/kaggle/working/feature_motion_appeare/train_motion",
+        "output_dir": "/kaggle/working/hme_ckpt_optimized",
+        "batch_size": 8,           # tăng batch size
+        "accum_steps": 1,          # giảm accumulation
+        "epochs": 50,              # tăng epochs
+        "lr": 1e-4,
+        "weight_decay": 5e-3,
+        "valid_split": 0.1,        # tăng valid split
+        "seed": 42,
+        "use_fp16": True,
+        "earlystop_patience": 6,
+        "num_workers": 8,
+        "motion_dim": 2304,
+        "appearance_dim": 768,
+        "text_dim": 768,
+        "motion_proj_dim": 1024,
+        "hidden_dim": 1024,
+        "num_motion_layers": 3,    # tăng số layers motion encoder
+        "dropout": 0.1,
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
+
+# -------------------------
+# Seed utility
+# -------------------------
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+# -------------------------
+# Evaluation
+# -------------------------
+def evaluate(model: nn.Module, loader: DataLoader, device: str, use_fp16: bool) -> Tuple[float, float]:
+    model.eval()
+    total_loss, total_correct, total_count = 0.0, 0, 0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Eval", leave=False):
+            appearance = batch["appearance_feats"].to(device)
+            motion = batch["motion_feats"].to(device)
+            text = batch["text_feats"].to(device)
+            mask_motion = batch.get("motion_mask", None)
+            if mask_motion is not None:
+                mask_motion = mask_motion.to(device)
+            labels = batch.get("labels", None)
+            if labels is not None:
+                labels = labels.to(device)
+
+            with autocast(enabled=use_fp16):
+                out = model(
+                    motion_feats=motion,
+                    motion_mask=mask_motion,
+                    appearance_feats=appearance,
+                    text_feats=text,
+                    labels=labels if (labels is not None and (labels!=-1).any()) else None
+                )
+                logits = out["logits"]
+                loss = loss_fn(logits, labels) if labels is not None else torch.tensor(0.0, device=device)
+
+            total_loss += loss.item() * appearance.size(0)
+
+            if labels is not None:
+                valid_mask = labels != -1
+                total_correct += (logits.argmax(dim=1)[valid_mask] == labels[valid_mask]).sum().item()
+                total_count += valid_mask.sum().item()
+
+    avg_loss = total_loss / len(loader.dataset)
+    avg_acc = total_correct / total_count if total_count > 0 else 0.0
+    return avg_loss, avg_acc
+
+# -------------------------
+# Training loop
+# -------------------------
+def train_loop(args):
+    seed_everything(args["seed"])
+    device = args["device"]
+
+    print("Loading MPNet text encoder...")
+    mpnet = load_text_encoder(device="cpu")
+
+    print("Preparing dataset...")
+    full_ds = FeatureVideoQAHME_MC(
+        json_path=args["data_json"],
+        feature_dir_appearance=args["feat_app_dir"],
+        feature_dir_motion=args["feat_mot_dir"],
+        text_encoder=mpnet,
+        preload_text=True,
+        is_test=False
     )
-    return nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+    # Split train/val
+    n = len(full_ds)
+    n_val = max(1, int(n * args["valid_split"]))
+    indices = list(range(n))
+    random.shuffle(indices)
+    val_idx, train_idx = indices[:n_val], indices[n_val:]
+
+    train_ds = Subset(full_ds, train_idx)
+    val_ds = Subset(full_ds, val_idx)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args["batch_size"],
+        shuffle=True,
+        num_workers=args["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn_hme
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args["batch_size"],
+        shuffle=False,
+        num_workers=args["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn_hme
+    )
+
+    print("Building HME_MC model...")
+    model = HME_MC(
+        motion_dim=args["motion_dim"],
+        appearance_dim=args["appearance_dim"],
+        text_dim=args["text_dim"],
+        hidden_dim=args["hidden_dim"],
+        motion_proj_dim=args["motion_proj_dim"],
+        num_motion_layers=args["num_motion_layers"],
+        fusion_heads=8,
+        motion_heads=8,
+        dropout=args["dropout"],
+        use_mean_pool_motion=False,  # multi-scale pooling
+        treat_text_as_query=True
+    ).to(device)
+
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                  lr=args["lr"], weight_decay=args["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1, verbose=True)
+    scaler = GradScaler(enabled=args["use_fp16"])
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    os.makedirs(args["output_dir"], exist_ok=True)
+
+    print("Start training...")
+    for epoch in range(args["epochs"]):
+        model.train()
+        running_loss = 0.0
+        optimizer.zero_grad()
+        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args['epochs']} train")):
+            appearance = batch["appearance_feats"].to(device)
+            motion = batch["motion_feats"].to(device)
+            text = batch["text_feats"].to(device)
+            mask_motion = batch.get("motion_mask", None)
+            if mask_motion is not None:
+                mask_motion = mask_motion.to(device)
+            labels = batch.get("labels", None)
+            if labels is not None:
+                labels = labels.to(device)
+
+            with autocast(enabled=args["use_fp16"]):
+                out = model(
+                    motion_feats=motion,
+                    motion_mask=mask_motion,
+                    appearance_feats=appearance,
+                    text_feats=text,
+                    labels=labels if (labels is not None and (labels!=-1).any()) else None
+                )
+                logits = out["logits"]
+                loss = loss_fn(logits, labels)
+                loss_to_back = loss / args["accum_steps"]
+
+            scaler.scale(loss_to_back).backward()
+
+            if (step + 1) % args["accum_steps"] == 0 or (step + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            running_loss += loss.item()
+            tqdm.write(f"Step {step+1}, Loss: {running_loss/(step+1):.4f}")
+
+        val_loss, val_acc = evaluate(model, val_loader, device, args["use_fp16"])
+        print(f"Epoch {epoch+1} - val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}")
+        scheduler.step(val_loss)
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            ckpt = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "args": args
+            }
+            torch.save(ckpt, os.path.join(args["output_dir"], "best_model.pt"))
+            print(f"Saved best_model.pt (val_loss={val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args["earlystop_patience"]:
+                print("Early stopping triggered.")
+                break
+
+    print("Training finished.")
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss": best_val_loss,
+        "args": args
+    }, os.path.join(args["output_dir"], "last_model.pt"))
+    print("Saved last_model.pt")
 
 # -------------------------
-# HME-style Multi-choice VideoQA Model
+# CLI
 # -------------------------
-class HME_MC(nn.Module):
-    """
-    HME-style multi-choice VideoQA model (practical / efficient).
-    Inputs:
-      - motion_feats: [B, T, D_m] (clip-level motion embeddings)
-      - motion_mask:  [B, T] (1 for valid, 0 for pad)
-      - appearance_feats: [B, D_a] (single vector per video)
-      - text_feats: [B, C, D_t] (MPNet embeddings per choice)
-    Output:
-      - logits: [B, C] (scores for each choice)
-    """
+if __name__ == "__main__":
+    default_args = get_default_args()
+    parser = argparse.ArgumentParser()
+    for k, v in default_args.items():
+        parser.add_argument(f"--{k}", type=type(v), default=v)
+    parsed = vars(parser.parse_args())
+    parsed["use_fp16"] = bool(parsed["use_fp16"])
+    parsed["seed"] = int(parsed["seed"])
+    parsed["device"] = parsed["device"]
+    parsed["num_workers"] = int(parsed["num_workers"])
+    parsed["batch_size"] = int(parsed["batch_size"])
+    parsed["accum_steps"] = int(parsed["accum_steps"])
+    parsed["epochs"] = int(parsed["epochs"])
+    parsed["earlystop_patience"] = int(parsed["earlystop_patience"])
 
-    def __init__(
-        self,
-        motion_dim: int = 2304,
-        appearance_dim: int = 768,
-        text_dim: int = 768,
-        hidden_dim: int = 1024,
-        motion_proj_dim: int = 1024,
-        num_motion_layers: int = 2,
-        motion_heads: int = 8,
-        fusion_heads: int = 8,
-        dropout: float = 0.1,
-        use_mean_pool_motion: bool = False,
-        treat_text_as_query: bool = True,
-    ):
-        super().__init__()
-        self.motion_dim = motion_dim
-        self.appearance_dim = appearance_dim
-        self.text_dim = text_dim
-        self.hidden_dim = hidden_dim
-        self.use_mean_pool_motion = use_mean_pool_motion
-        self.treat_text_as_query = treat_text_as_query
-
-        # --- project raw features into common hidden space ---
-        self.motion_proj = nn.Linear(motion_dim, motion_proj_dim)
-        self.motion_ln = nn.LayerNorm(motion_proj_dim)
-        self.motion_encoder = build_transformer_encoder(
-            dim=motion_proj_dim,
-            num_layers=num_motion_layers,
-            num_heads=motion_heads,
-            dropout=dropout,
-        )
-
-        self.appearance_proj = nn.Linear(appearance_dim, motion_proj_dim)
-        self.appearance_ln = nn.LayerNorm(motion_proj_dim)
-
-        # Project text into same hidden dim
-        self.text_proj = nn.Linear(text_dim, motion_proj_dim)
-        self.text_ln = nn.LayerNorm(motion_proj_dim)
-
-        # Cross-modal attention: text queries attend to video tokens (motion+appearance)
-        # We'll implement as multihead attention modules.
-        self.cross_attn = nn.MultiheadAttention(embed_dim=motion_proj_dim, num_heads=fusion_heads, dropout=dropout, batch_first=True)
-        self.cross_attn_ln = nn.LayerNorm(motion_proj_dim)
-
-        # Small feed-forward after fusion
-        self.fusion_ff = nn.Sequential(
-            nn.Linear(motion_proj_dim, motion_proj_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(motion_proj_dim, motion_proj_dim),
-        )
-        self.fusion_ln = nn.LayerNorm(motion_proj_dim)
-
-        # Final scoring head: take per-choice representation -> score
-        # We'll produce per-choice vector by attending text (choice) over video, then combine
-        self.classifier = nn.Sequential(
-            nn.Linear(motion_proj_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)  # one logit per choice
-        )
-
-    def forward(
-        self,
-        motion_feats: torch.Tensor,         # [B, T, D_m] or [B, 1, D_m] when single
-        motion_mask: Optional[torch.Tensor],# [B, T]  (1 for valid)
-        appearance_feats: torch.Tensor,     # [B, D_a] or [B, 1, D_a]
-        text_feats: torch.Tensor,           # [B, C, D_t]
-        labels: Optional[torch.Tensor] = None,
-    ):
-        B = motion_feats.shape[0]
-        device = motion_feats.device
-
-        # --- Project motion ---
-        mot = self.motion_proj(motion_feats)           # [B, T, M]
-        mot = self.motion_ln(mot)
-
-        # Apply motion encoder (with mask)
-        if self.use_mean_pool_motion:
-            # skip temporal encoder if we just mean pool
-            if motion_mask is not None:
-                denom = motion_mask.sum(dim=1, keepdim=True).clamp(min=1).to(mot.dtype)
-                mot_pooled = (mot * motion_mask.unsqueeze(-1)).sum(dim=1) / denom  # [B, M]
-            else:
-                mot_pooled = mot.mean(dim=1)
-            # use mot_pooled as the single token
-            mot_tokens = mot_pooled.unsqueeze(1)  # [B,1,M]
-        else:
-            # Build key_padding_mask for nn.TransformerEncoder: True for positions to mask
-            if motion_mask is not None:
-                # TransformerEncoder expects key_padding_mask shape [B, T] with True at PAD positions
-                key_padding_mask = (motion_mask == 0)  # pad positions True
-            else:
-                key_padding_mask = None
-            mot_tokens = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)  # [B, T, M]
-
-        # --- Appearance projection: add as an extra token to video tokens ---
-        app = self.appearance_proj(appearance_feats)  # [B, M] or [B,1,M]
-        app = self.appearance_ln(app)
-        # ensure app shape [B, 1, M]
-        if app.dim() == 2:
-            app_tok = app.unsqueeze(1)
-        else:
-            app_tok = app
-
-        if self.use_mean_pool_motion:
-            # mot_tokens: [B, 1, M]
-            video_tokens = torch.cat([app_tok, mot_tokens], dim=1)  # [B, 2, M]
-            video_mask = torch.ones((B, video_tokens.shape[1]), dtype=torch.long, device=device)
-        else:
-            # mot_tokens: [B, T, M]; cat app at front
-            video_tokens = torch.cat([app_tok, mot_tokens], dim=1)  # [B, T+1, M]
-            if motion_mask is not None:
-                # combine app valid + motion_mask
-                app_mask = torch.ones((B,1), dtype=motion_mask.dtype, device=device)
-                video_mask = torch.cat([app_mask, motion_mask], dim=1)  # [B, T+1]
-            else:
-                video_mask = None
-
-        # --- Project text ---
-        # text_feats: [B, C, D_t] -> project to [B, C, M]
-        txt = self.text_proj(text_feats)
-        txt = self.text_ln(txt)
-
-        # For each choice, let text vector (single token per choice) query video tokens.
-        # We will treat text choice as query; video tokens as key/value.
-        # Prepare cross-attn inputs for MultiheadAttention (batch_first=True)
-        # Flatten batch+choices to compute in one call.
-        B, C, M = txt.shape
-        # txt reshape -> [B*C, 1, M] (we use mean of choice tokens as single query)
-        # Here txt is already one vector per choice; if it had sequence, you'd pool first.
-        queries = txt.view(B*C, 1, M)  # [B*C, 1, M]
-        keys = video_tokens.repeat_interleave(C, dim=0)  # [B*C, S, M]
-
-        if video_mask is not None:
-            # key_padding_mask for multihead attn expects shape [B*C, S] with True for PAD
-            key_padding_mask = (video_mask == 0).repeat_interleave(C, dim=0)  # [B*C, S]
-        else:
-            key_padding_mask = None
-
-        # MultiheadAttention (query, key, value). returns (attended, weights)
-        attn_out, _ = self.cross_attn(queries, keys, keys, key_padding_mask=key_padding_mask)
-        attn_out = self.cross_attn_ln(attn_out.squeeze(1))  # [B*C, M]
-
-        # fusion feed-forward
-        fused = self.fusion_ln(self.fusion_ff(attn_out))  # [B*C, M]
-
-        # Combine text vector (txt) and fused video-attended vector
-        txt_flat = txt.view(B*C, M)
-        combined = torch.cat([txt_flat, fused], dim=-1)  # [B*C, 2M]
-
-        logits_per_choice = self.classifier(combined).view(B, C)  # [B, C]
-
-        output = {"logits": logits_per_choice}
-
-        if labels is not None:
-            loss = F.cross_entropy(logits_per_choice, labels)
-            output["loss"] = loss
-
-        return output
+    train_loop(parsed)

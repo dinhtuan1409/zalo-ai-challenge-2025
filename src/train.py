@@ -1,228 +1,262 @@
+# train_optimized.py
 import os
+import random
 import json
+import argparse
+from typing import Tuple
+
+import numpy as np
 import torch
-from torch.utils.data import Dataset
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Optional
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
-# Ngăn transformers tự ý thêm template, giữ cho [SEP] hoạt động
-os.environ["TRANSFORMERS_NO_ADDITIONAL_CHAT_TEMPLATES"] = "1"
+from model import HME_MC
+from dataset import FeatureVideoQAHME_MC, load_text_encoder, collate_fn_hme
 
-# ===========================================================
-# ✅ LOAD TEXT ENCODER (MPNet)
-# ===========================================================
-
-def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
-    """
-    Load SentenceTransformer MPNet.
-    Chỉ load 1 lần duy nhất trong main process.
-    """
-    model = SentenceTransformer(
-        "sentence-transformers/all-mpnet-base-v2",
-        trust_remote_code=True
-    )
-    model.eval()
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    model = model.to(device)
-    print(f"Text encoder (MPNet) loaded on device: {device}")
-    return model
-
-
-# ===========================================================
-# ✅ DATASET – Video feature (.pt) + Text MPNet encode
-# *BỔ SUNG RAW TEXT*
-# ===========================================================
-
-class FeatureVideoQADatasetMPNET(Dataset):
-    """
-    Video: load từ .pt (shape: D_video)
-    Text: encode trực tiếp bằng MPNet (shape: num_choices x 768)
-    Bổ sung: Raw question và choices (dùng cho LLM)
-    """
-
-    def __init__(self, 
-                 json_path: str, 
-                 video_feat_dir: str,
-                 video_feat_dim: int = 2304,
-                 text_encoder: Optional[SentenceTransformer] = None,
-                 preload_text: bool = True,
-                 is_test: bool = False):
-        """
-        preload_text=True: encode toàn bộ text trước → nhanh nhất, ổn định nhất
-        """
-        with open(json_path, "r", encoding="utf-8") as f:
-            self.items = json.load(f)["data"]
-
-        self.video_feat_dir = video_feat_dir
-        self.video_feat_dim = video_feat_dim
-        self.is_test = is_test
-
-        # text encoder (MPNet)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # ❗ LƯU Ý: Vẫn cần MPNet encoder để tạo ra text_feats cho Fusion Module
-        self.text_encoder = text_encoder if text_encoder else load_text_encoder(self.device)
-
-        # ✅ Preload text → encode 1 lần (khuyên dùng)
-        self.preload_text = preload_text
-        if preload_text:
-            print("⚡ Encoding toàn bộ text bằng MPNet (1 lần duy nhất)...")
-            self.text_cache = self._pre_encode_all_text()
-        else:
-            print("⚠️ Cảnh báo: `preload_text=False`. Text sẽ được encode on-the-fly, rất chậm.")
-            self.text_cache = None
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    # -------------------------------------------------------
-    # ✅ Encode toàn bộ text trước
-    # -------------------------------------------------------
-    @torch.no_grad()
-    def _pre_encode_all_text(self) -> Dict[str, torch.Tensor]:
-        cache = {}
-
-        for item in self.items:
-            qid = item["id"]
-            question = item["question"]
-            choices = item["choices"]
-
-            # Format: [ "Question [SEP] Choice 1", "Question [SEP] Choice 2", ... ]
-            texts = [question + " [SEP] " + c for c in choices]
-
-            emb = self.text_encoder.encode(
-                texts,
-                convert_to_tensor=True,
-                device=self.device,
-                show_progress_bar=False
-            )
-            
-            # Quan trọng: Chuyển về CPU trước khi lưu vào cache
-            cache[qid] = emb.float().cpu()
-
-        print(f"✅ Pre-encoded và cached {len(cache)} text items.")
-        return cache
-
-    # -------------------------------------------------------
-    # ✅ Encode text khi không preload (chậm, không khuyên dùng)
-    # -------------------------------------------------------
-    @torch.no_grad()
-    def encode_text(self, texts: List[str]) -> torch.Tensor:
-        emb = self.text_encoder.encode(
-            texts,
-            convert_to_tensor=True,
-            device=self.device,
-            show_progress_bar=False
-        )
-        return emb.float().cpu()
-
-    # -------------------------------------------------------
-    # ✅ GET ITEM
-    # *BỔ SUNG RAW TEXT*
-    # -------------------------------------------------------
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        item = self.items[idx]
-        qid = item["id"]
-        
-        # Lấy text thô (MỚI)
-        question = item["question"]
-        choice_texts = item["choices"]
-
-        # 1️⃣ Video feature
-        vid = os.path.splitext(os.path.basename(item["video_path"]))[0]
-        feat_path = os.path.join(self.video_feat_dir, f"{vid}.pt")
-
-        if os.path.exists(feat_path):
-            video_feat = torch.load(feat_path).float()
-        else:
-            video_feat = torch.zeros(self.video_feat_dim)
-
-        # 2️⃣ Text feature (MPNet embeddings)
-        if self.preload_text:
-            text_feats = self.text_cache[qid]
-        else:
-            # Chế độ on-the-fly (rất chậm)
-            texts = [question + " [SEP] " + c for c in choice_texts]
-            text_feats = self.encode_text(texts)
-
-        # 3️⃣ Label
-        label = -1
-        if not self.is_test:
-            ans = item.get("answer")
-            if ans:
-                for i, c in enumerate(choice_texts): # Dùng choice_texts
-                    if ans.strip() == c.strip():
-                        label = i
-                        break
-
-        # 4️⃣ Return (BỔ SUNG RAW TEXT)
-        base_return = {
-            "id": qid,
-            "video_feat": video_feat,
-            "text_feats": text_feats,
-            "question": question,         # MỚI: Text thô
-            "choice_texts": choice_texts, # MỚI: List of strings thô
-        }
-
-        if not self.is_test:
-            base_return["label"] = label
-        
-        return base_return
-
-
-# ===========================================================
-# ✅ COLLATE FN (PAD CHOICE)
-# *XỬ LÝ RAW TEXT*
-# ===========================================================
-
-def collate_fn_mpnet(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Hàm Collate tùy chỉnh:
-    1. Pad text_feats (tensor MPNet)
-    2. Gộp raw text (strings) thành list
-    """
-    
-    # Tìm số lượng choices tối đa trong batch này
-    max_choice = max(b["text_feats"].shape[0] for b in batch)
-
-    ids, video_feats, text_feats, labels = [], [], [], []
-    # MỚI: Lưu trữ raw text
-    questions: List[str] = []
-    raw_choice_texts: List[List[str]] = []
-
-    has_labels = "label" in batch[0]
-
-    for b in batch:
-        ids.append(b["id"])
-        video_feats.append(b["video_feat"])
-
-        # MỚI: Lấy raw text (chỉ append list/string, KHÔNG STACK)
-        questions.append(b["question"])
-        raw_choice_texts.append(b["choice_texts"])
-
-        # Xử lý padding cho text_feats (tensor MPNet embeddings)
-        tf = b["text_feats"]
-        num_c, dim = tf.shape
-
-        if num_c < max_choice:
-            # Tạo tensor padding (số_lượng_pad, dim)
-            pad = torch.zeros((max_choice - num_c, dim), dtype=tf.dtype)
-            tf = torch.cat([tf, pad], dim=0)
-
-        text_feats.append(tf)
-
-        if has_labels:
-            labels.append(b["label"])
-
-    # Stack tensors và trả về raw text
+# -------------------------
+# Default hyperparameters
+# -------------------------
+def get_default_args():
     return {
-        "ids": ids,
-        "video_feats": torch.stack(video_feats).float(),
-        "text_feats": torch.stack(text_feats).float(),
-        "labels": torch.tensor(labels, dtype=torch.long) if has_labels else None,
-        # MỚI: Trả về list text thô
-        "questions": questions,
-        "choice_texts": raw_choice_texts,
+        "data_json": "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/train/train.json",
+        "feat_app_dir": "/kaggle/working/feature_motion_appeare/train_appear",
+        "feat_mot_dir": "/kaggle/working/feature_motion_appeare/train_motion",
+        "output_dir": "/kaggle/working/hme_ckpt_optimized",
+        "batch_size": 8,           # tăng batch size
+        "accum_steps": 1,          # giảm accumulation
+        "epochs": 50,              # tăng epochs
+        "lr": 1e-4,
+        "weight_decay": 5e-3,
+        "valid_split": 0.1,        # tăng valid split
+        "seed": 42,
+        "use_fp16": True,
+        "earlystop_patience": 6,
+        "num_workers": 8,
+        "motion_dim": 2304,
+        "appearance_dim": 768,
+        "text_dim": 768,
+        "motion_proj_dim": 1024,
+        "hidden_dim": 1024,
+        "num_motion_layers": 3,    # tăng số layers motion encoder
+        "dropout": 0.1,
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
+
+# -------------------------
+# Seed utility
+# -------------------------
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+# -------------------------
+# Evaluation
+# -------------------------
+def evaluate(model: nn.Module, loader: DataLoader, device: str, use_fp16: bool) -> Tuple[float, float]:
+    model.eval()
+    total_loss, total_correct, total_count = 0.0, 0, 0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Eval", leave=False):
+            appearance = batch["appearance_feats"].to(device)
+            motion = batch["motion_feats"].to(device)
+            text = batch["text_feats"].to(device)
+            mask_motion = batch.get("motion_mask", None)
+            if mask_motion is not None:
+                mask_motion = mask_motion.to(device)
+            labels = batch.get("labels", None)
+            if labels is not None:
+                labels = labels.to(device)
+
+            with autocast(enabled=use_fp16):
+                out = model(
+                    motion_feats=motion,
+                    motion_mask=mask_motion,
+                    appearance_feats=appearance,
+                    text_feats=text,
+                    labels=labels if (labels is not None and (labels!=-1).any()) else None
+                )
+                logits = out["logits"]
+                loss = loss_fn(logits, labels) if labels is not None else torch.tensor(0.0, device=device)
+
+            total_loss += loss.item() * appearance.size(0)
+
+            if labels is not None:
+                valid_mask = labels != -1
+                total_correct += (logits.argmax(dim=1)[valid_mask] == labels[valid_mask]).sum().item()
+                total_count += valid_mask.sum().item()
+
+    avg_loss = total_loss / len(loader.dataset)
+    avg_acc = total_correct / total_count if total_count > 0 else 0.0
+    return avg_loss, avg_acc
+
+# -------------------------
+# Training loop
+# -------------------------
+def train_loop(args):
+    seed_everything(args["seed"])
+    device = args["device"]
+
+    print("Loading MPNet text encoder...")
+    mpnet = load_text_encoder(device="cpu")
+
+    print("Preparing dataset...")
+    full_ds = FeatureVideoQAHME_MC(
+        json_path=args["data_json"],
+        feature_dir_appearance=args["feat_app_dir"],
+        feature_dir_motion=args["feat_mot_dir"],
+        text_encoder=mpnet,
+        preload_text=True,
+        is_test=False
+    )
+
+    # Split train/val
+    n = len(full_ds)
+    n_val = max(1, int(n * args["valid_split"]))
+    indices = list(range(n))
+    random.shuffle(indices)
+    val_idx, train_idx = indices[:n_val], indices[n_val:]
+
+    train_ds = Subset(full_ds, train_idx)
+    val_ds = Subset(full_ds, val_idx)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args["batch_size"],
+        shuffle=True,
+        num_workers=args["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn_hme
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args["batch_size"],
+        shuffle=False,
+        num_workers=args["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn_hme
+    )
+
+    print("Building HME_MC model...")
+    model = HME_MC(
+        motion_dim=args["motion_dim"],
+        appearance_dim=args["appearance_dim"],
+        text_dim=args["text_dim"],
+        hidden_dim=args["hidden_dim"],
+        motion_proj_dim=args["motion_proj_dim"],
+        num_motion_layers=args["num_motion_layers"],
+        fusion_heads=8,
+        motion_heads=8,
+        dropout=args["dropout"],
+        use_mean_pool_motion=False,  # multi-scale pooling
+        treat_text_as_query=True
+    ).to(device)
+
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                  lr=args["lr"], weight_decay=args["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1, verbose=True)
+    scaler = GradScaler(enabled=args["use_fp16"])
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    os.makedirs(args["output_dir"], exist_ok=True)
+
+    print("Start training...")
+    for epoch in range(args["epochs"]):
+        model.train()
+        running_loss = 0.0
+        optimizer.zero_grad()
+        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args['epochs']} train")):
+            appearance = batch["appearance_feats"].to(device)
+            motion = batch["motion_feats"].to(device)
+            text = batch["text_feats"].to(device)
+            mask_motion = batch.get("motion_mask", None)
+            if mask_motion is not None:
+                mask_motion = mask_motion.to(device)
+            labels = batch.get("labels", None)
+            if labels is not None:
+                labels = labels.to(device)
+
+            with autocast(enabled=args["use_fp16"]):
+                out = model(
+                    motion_feats=motion,
+                    motion_mask=mask_motion,
+                    appearance_feats=appearance,
+                    text_feats=text,
+                    labels=labels if (labels is not None and (labels!=-1).any()) else None
+                )
+                logits = out["logits"]
+                loss = loss_fn(logits, labels)
+                loss_to_back = loss / args["accum_steps"]
+
+            scaler.scale(loss_to_back).backward()
+
+            if (step + 1) % args["accum_steps"] == 0 or (step + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            running_loss += loss.item()
+            tqdm.write(f"Step {step+1}, Loss: {running_loss/(step+1):.4f}")
+
+        val_loss, val_acc = evaluate(model, val_loader, device, args["use_fp16"])
+        print(f"Epoch {epoch+1} - val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}")
+        scheduler.step(val_loss)
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            ckpt = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "args": args
+            }
+            torch.save(ckpt, os.path.join(args["output_dir"], "best_model.pt"))
+            print(f"Saved best_model.pt (val_loss={val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args["earlystop_patience"]:
+                print("Early stopping triggered.")
+                break
+
+    print("Training finished.")
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss": best_val_loss,
+        "args": args
+    }, os.path.join(args["output_dir"], "last_model.pt"))
+    print("Saved last_model.pt")
+
+# -------------------------
+# CLI
+# -------------------------
+if __name__ == "__main__":
+    default_args = get_default_args()
+    parser = argparse.ArgumentParser()
+    for k, v in default_args.items():
+        parser.add_argument(f"--{k}", type=type(v), default=v)
+    parsed = vars(parser.parse_args())
+    parsed["use_fp16"] = bool(parsed["use_fp16"])
+    parsed["seed"] = int(parsed["seed"])
+    parsed["device"] = parsed["device"]
+    parsed["num_workers"] = int(parsed["num_workers"])
+    parsed["batch_size"] = int(parsed["batch_size"])
+    parsed["accum_steps"] = int(parsed["accum_steps"])
+    parsed["epochs"] = int(parsed["epochs"])
+    parsed["earlystop_patience"] = int(parsed["earlystop_patience"])
+
+    train_loop(parsed)
