@@ -15,7 +15,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 # --- import your modules (adjust paths/names if needed) ---
 from model import HME_MC
-from dataset import FeatureVideoQAHME_MC_CLIP, load_text_encoder,collate_fn_hme_clip
+from dataset import FeatureVideoQAHME_MC_CLIP, CLIPTextEncoder,collate_fn_hme_clip
 
 # -------------------------
 # Config / Hyperparameters
