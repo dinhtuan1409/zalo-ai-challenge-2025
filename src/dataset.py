@@ -1,3 +1,4 @@
+# dataset_hme.py
 import os
 import json
 import torch
@@ -5,32 +6,27 @@ from torch.utils.data import Dataset
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Optional
 
-os.environ["TRANSFORMERS_NO_ADDITIONAL_CHAT_TEMPLATES"] = "1"
-
-
 # ===========================================================
-# ✅ TEXT ENCODER
+# ✅ Load Text Encoder
 # ===========================================================
 def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
-    model = SentenceTransformer(
-        "sentence-transformers/all-mpnet-base-v2"
-    )
-    model.eval()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2", trust_remote_code=True)
+    model.eval()
     model = model.to(device)
-    print(f"Text encoder (MPNet) loaded on {device}")
+    print(f"Text encoder loaded on {device}")
     return model
 
 
 # ===========================================================
-# ✅ DATASET
+# ✅ Dataset for HME-VideoQA Multi-choice
 # ===========================================================
 class FeatureVideoQAHME_MC(Dataset):
     """
-    Dataset tối ưu cho HME multiple-choice:
-      - appearance_feat: [1, 768]
-      - motion_feat: [T, 2304]
-      - text_feats: [num_choices, 768]
+    Dataset cho HME Multi-choice VideoQA
+      - Appearance feature: [B, 768] (saved per video ID)
+      - Motion feature: [B, T, 2304] (saved per video_path)
+      - Text feature: [B, C, 768] (MPNet embeddings)
     """
 
     def __init__(
@@ -54,10 +50,11 @@ class FeatureVideoQAHME_MC(Dataset):
 
         self.preload_text = preload_text
         if preload_text:
-            print("⚡ Pre-encoding text (MPNet)...")
+            print("⚡ Pre-encoding all text (MPNet)...")
             self.text_cache = self._pre_encode_all_text()
         else:
             self.text_cache = None
+            print("⚠️ preload_text=False → encode text on-the-fly (slower).")
 
     def __len__(self):
         return len(self.items)
@@ -71,18 +68,15 @@ class FeatureVideoQAHME_MC(Dataset):
             choices = item["choices"]
             texts = [question + " [SEP] " + c for c in choices]
             emb = self.text_encoder.encode(
-                texts, convert_to_tensor=True, device=self.device
+                texts, convert_to_tensor=True, device=self.device, show_progress_bar=False
             )
             cache[qid] = emb.float().cpu()
         return cache
 
-    def _safe_load(self, path: str) -> torch.Tensor:
-        if not os.path.exists(path):
-            return torch.zeros(1, 768)
-        feat = torch.load(path, map_location="cpu")
-        if not torch.is_tensor(feat):
-            feat = torch.tensor(feat)
-        return feat.float()
+    @torch.no_grad()
+    def encode_text(self, texts: List[str]) -> torch.Tensor:
+        emb = self.text_encoder.encode(texts, convert_to_tensor=True, device=self.device, show_progress_bar=False)
+        return emb.float().cpu()
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
@@ -90,25 +84,27 @@ class FeatureVideoQAHME_MC(Dataset):
         question = item["question"]
         choices = item["choices"]
 
-        # Appearance theo id
+        # --- Appearance feature (per video ID) ---
         path_app = os.path.join(self.feature_dir_appearance, f"{qid}.pt")
-        feat_app = self._safe_load(path_app)
-        if feat_app.dim() == 2 and feat_app.shape[0] == 1:
-            feat_app = feat_app.squeeze(0)  # [768]
+        feat_app = torch.load(path_app).squeeze(0) if os.path.exists(path_app) else torch.zeros(768)
 
-        # Motion theo tên video_path
+        # --- Motion feature (per video_path) ---
         video_name = os.path.splitext(os.path.basename(item["video_path"]))[0]
-        path_motion = os.path.join(self.feature_dir_motion, f"{video_name}.pt")
-        feat_mot = self._safe_load(path_motion)  # [T, 2304]
+        path_mot = os.path.join(self.feature_dir_motion, f"{video_name}.pt")
+        if os.path.exists(path_mot):
+            feat_mot = torch.load(path_mot)           # [T, 2304]
+        else:
+            feat_mot = torch.zeros((1, 2304))
+        motion_mask = torch.ones(feat_mot.shape[0], dtype=torch.long)
 
-        # Text
+        # --- Text feature ---
         if self.preload_text:
-            text_feats = self.text_cache[qid]
+            text_feats = self.text_cache[qid]          # [C, 768]
         else:
             texts = [question + " [SEP] " + c for c in choices]
-            text_feats = self.text_encoder.encode(texts, convert_to_tensor=True)
+            text_feats = self.encode_text(texts)
 
-        # Label
+        # --- Label ---
         label = -1
         if not self.is_test:
             ans = item.get("answer")
@@ -120,59 +116,60 @@ class FeatureVideoQAHME_MC(Dataset):
 
         return {
             "id": qid,
-            "appearance_feat": feat_app,  # [768]
-            "motion_feat": feat_mot,      # [T, 2304]
-            "text_feats": text_feats,     # [num_choices, 768]
+            "appearance_feat": feat_app,       # [768]
+            "motion_feat": feat_mot,           # [T, 2304]
+            "motion_mask": motion_mask,        # [T]
+            "text_feats": text_feats,          # [C, 768]
             "question": question,
             "choice_texts": choices,
-            "label": label if not self.is_test else None,
+            "label": label
         }
 
 
-def collate_fn_hme_mc(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+# ===========================================================
+# ✅ Collate function
+# ===========================================================
+def collate_fn_hme(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Collate for HME MC VideoQA
+      - Pads motion features to max T in batch
+      - Stacks appearance, text, labels
+    """
+    batch_size = len(batch)
+    # --- Motion ---
     max_T = max(b["motion_feat"].shape[0] for b in batch)
-    max_choice = max(b["text_feats"].shape[0] for b in batch)
+    motion_feats = torch.zeros((batch_size, max_T, 2304))
+    motion_mask = torch.zeros((batch_size, max_T), dtype=torch.long)
+    for i, b in enumerate(batch):
+        T_b = b["motion_feat"].shape[0]
+        motion_feats[i, :T_b] = b["motion_feat"]
+        motion_mask[i, :T_b] = b["motion_mask"]
 
-    ids, app_feats, mot_feats, text_feats, labels = [], [], [], [], []
-    questions, raw_choices = [], []
+    # --- Appearance ---
+    appearance_feats = torch.stack([b["appearance_feat"] for b in batch], dim=0)  # [B, 768]
 
-    has_label = batch[0]["label"] is not None
+    # --- Text ---
+    max_C = max(b["text_feats"].shape[0] for b in batch)
+    text_feats = torch.zeros((batch_size, max_C, 768))
+    for i, b in enumerate(batch):
+        C_b = b["text_feats"].shape[0]
+        text_feats[i, :C_b] = b["text_feats"]
 
-    for b in batch:
-        ids.append(b["id"])
-        questions.append(b["question"])
-        raw_choices.append(b["choice_texts"])
+    # --- Labels ---
+    labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
 
-        # appearance [768]
-        app_feats.append(b["appearance_feat"])
-
-        # motion [T,2304] → pad
-        mot = b["motion_feat"]
-        pad_len = max_T - mot.shape[0]
-        if pad_len > 0:
-            pad = torch.zeros(pad_len, mot.shape[1])
-            mot = torch.cat([mot, pad], dim=0)
-        mot_feats.append(mot)
-
-        # text [num_choices,768] → pad
-        tf = b["text_feats"]
-        if tf.shape[0] < max_choice:
-            pad = torch.zeros(max_choice - tf.shape[0], tf.shape[1])
-            tf = torch.cat([tf, pad], dim=0)
-        text_feats.append(tf)
-
-        if has_label:
-            labels.append(b["label"])
+    # --- Raw text ---
+    questions = [b["question"] for b in batch]
+    choice_texts = [b["choice_texts"] for b in batch]
+    ids = [b["id"] for b in batch]
 
     return {
         "ids": ids,
-        "appearance_feats": torch.stack(app_feats).float(),  # [B,768]
-        "motion_feats": torch.stack(mot_feats).float(),      # [B,T,2304]
-        "text_feats": torch.stack(text_feats).float(),       # [B,num_choices,768]
-        "labels": torch.tensor(labels, dtype=torch.long) if has_label else None,
+        "appearance_feats": appearance_feats,
+        "motion_feats": motion_feats,
+        "motion_mask": motion_mask,
+        "text_feats": text_feats,
+        "labels": labels,
         "questions": questions,
-        "choice_texts": raw_choices,
-        "mask_motion": torch.tensor(  # [B,T], 1 = real, 0 = pad
-            [[1]*b["motion_feat"].shape[0] + [0]*(max_T - b["motion_feat"].shape[0]) for b in batch]
-        ),
+        "choice_texts": choice_texts
     }
