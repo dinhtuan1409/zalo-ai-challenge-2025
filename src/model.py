@@ -21,7 +21,7 @@ def build_transformer_encoder(dim, num_layers=2, num_heads=8, mlp_ratio=4.0, dro
 # -------------------------
 # HME-style Multi-choice VideoQA with Memory + Iterative Reasoning
 # -------------------------
-class HME_MC_v2(nn.Module):
+class HME_MC(nn.Module):
     def __init__(
         self,
         motion_dim: int = 2304,
