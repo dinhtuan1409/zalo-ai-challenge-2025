@@ -168,7 +168,7 @@ def collate_fn_hme_clip(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # --- Text ---
     feat_dim = batch[0]["text_feats"].shape[1]
     max_C = max(b["text_feats"].shape[0] for b in batch)
-    text_feats = torch.zeros((B, max_C, feat_dim))
+    text_feats = torch.zeros((B, max_C, feat_dim), device=batch[0]["text_feats"].device)
     for i, b in enumerate(batch):
         C_b = b["text_feats"].shape[0]
         text_feats[i, :C_b] = b["text_feats"]
