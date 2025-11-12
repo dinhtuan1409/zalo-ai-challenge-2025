@@ -53,7 +53,7 @@ class FeatureVideoQAHME_CLIP(Dataset):
 
         # --- Load Motion (SlowFast) ---
         video_name = os.path.splitext(os.path.basename(item["video_path"]))[0]
-        path_mot = os.path.join(self.feature_dir_motion, f"{video_name}.pt")
+        path_mot = os.path.join(self.feat_mot_dir, f"{video_name}.pt")
         if os.path.exists(path_mot):
             feat_mot = torch.load(path_mot).float()  # [T, 2304]
         else:
