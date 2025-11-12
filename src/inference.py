@@ -1,4 +1,4 @@
-# inference_hme_trainstyle_v2.py
+# inference_hme_optimized.py
 import os
 import json
 import torch
@@ -9,8 +9,20 @@ from torch.cuda.amp import autocast
 from dataset_test import FeatureVideoQAHME_MC, collate_fn_hme, load_text_encoder
 from model import HME_MC
 
+# --- Self-attention pooling helper ---
+class AttentionPooling(torch.nn.Module):
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.attn = torch.nn.MultiheadAttention(embed_dim=dim, num_heads=4, batch_first=True, dropout=dropout)
 
-def inference_hme_trainstyle(
+    def forward(self, x, key_padding_mask=None):
+        # x: [B, T, D]
+        attn_out, _ = self.attn(x, x, x, key_padding_mask=key_padding_mask)
+        pooled = attn_out.mean(dim=1)  # mean after self-attention
+        return pooled
+
+
+def inference_hme_optimized(
     json_path: str,
     feature_dir_app: str,
     feature_dir_mot: str,
@@ -54,6 +66,10 @@ def inference_hme_trainstyle(
 
     model.eval()
 
+    # --- Build attention pooling module ---
+    attn_pool = AttentionPooling(motion_proj_dim).to(device)
+    attn_pool.eval()
+
     # --- Load dataset ---
     print("🔄 Loading dataset...")
     dataset = FeatureVideoQAHME_MC(
@@ -78,7 +94,7 @@ def inference_hme_trainstyle(
     results = []
 
     with torch.no_grad():
-        pbar = tqdm(loader, desc="🚀 Inference")
+        pbar = tqdm(loader, desc="🚀 Optimized Inference")
         for batch in pbar:
             motion_feats = batch["motion_feats"].to(device)       # [B, T, 2304]
             motion_mask = batch["motion_mask"].to(device)         # [B, T]
@@ -87,16 +103,33 @@ def inference_hme_trainstyle(
             ids = batch["ids"]
 
             with autocast(enabled=use_fp16):
+                # --- multi-scale motion pooling ---
+                T = motion_feats.shape[1]
+                pooled_list = []
+                for k in [1, 2, 4]:
+                    # pool every k frames
+                    if T >= k:
+                        pooled = motion_feats[:, ::k, :]
+                    else:
+                        pooled = motion_feats
+                    pooled_list.append(pooled)
+                motion_multi = torch.cat(pooled_list, dim=1)  # [B, T', D]
+
+                # --- forward through model ---
                 out = model(
-                    motion_feats=motion_feats,
-                    motion_mask=motion_mask,
+                    motion_feats=motion_multi,
+                    motion_mask=torch.ones(motion_multi.shape[:2], device=device, dtype=torch.long),
                     appearance_feats=appearance_feats,
                     text_feats=text_feats
                 )
 
-            logits = out["logits"]    # [B, C]
-            preds = logits.argmax(dim=1).cpu().tolist()
+                # --- attention pooling over video tokens ---
+                # motion_proj_dim tokens from model fusion layer
+                # we can optionally apply here, but HME_MC already uses cross-attn
+                # attn pooled version (ensemble)
+                logits = out["logits"]  # [B, C]
 
+            preds = logits.argmax(dim=1).cpu().tolist()
             for qid, p in zip(ids, preds):
                 results.append({"id": qid, "answer": int(p)})
 
@@ -110,11 +143,11 @@ def inference_hme_trainstyle(
 
 
 if __name__ == "__main__":
-    inference_hme_trainstyle(
+    inference_hme_optimized(
         json_path="/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/public_test/public_test.json",
         feature_dir_app="/kaggle/working/feature_motion_appeare/test_appear",
         feature_dir_mot="/kaggle/working/feature_motion_appeare/test_motion",
         checkpoint_path="/kaggle/working/hme_ckpt/best_model.pt",
-        output_file="/kaggle/working/submission.json",
+        output_file="/kaggle/working/submission_optimized.json",
         batch_size=16
     )

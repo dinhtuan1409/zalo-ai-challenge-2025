@@ -3,159 +3,121 @@ import os
 import json
 import torch
 from torch.utils.data import Dataset
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
+from transformers import CLIPTokenizer, CLIPModel
 
 # -------------------------
-# Load Text Encoder
+# Dataset: Trả về raw text + features
 # -------------------------
-def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2", trust_remote_code=True)
-    model.eval()
-    model = model.to(device)
-    print(f"Text encoder loaded on {device}")
-    return model
-
-# -------------------------
-# Dataset
-# -------------------------
-class FeatureVideoQAHME_MC(Dataset):
+class FeatureVideoQAHME_CLIP(Dataset):
     def __init__(
         self,
         json_path: str,
         feature_dir_appearance: str,
         feature_dir_motion: str,
-        text_encoder: Optional[SentenceTransformer] = None,
-        preload_text: bool = True,
+        clip_model_name: str = "openai/clip-vit-base-patch32",
         is_test: bool = False,
     ):
-        with open(json_path, "r", encoding="utf-8") as f:
-            self.items = json.load(f)["data"]
+        # Load JSON
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if "data" in data:
+                self.items = data["data"]
+            else:
+                self.items = data  # nếu không có key "data"
 
-        self.feature_dir_appearance = feature_dir_appearance
-        self.feature_dir_motion = feature_dir_motion
+        self.feat_app_dir = feature_dir_appearance
+        self.feat_mot_dir = feature_dir_motion
         self.is_test = is_test
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.text_encoder = text_encoder or load_text_encoder(self.device)
-        self.preload_text = preload_text
 
-        if preload_text:
-            print("⚡ Pre-encoding all text (MPNet)...")
-            self.text_cache = self._pre_encode_all_text()
-        else:
-            self.text_cache = None
-            print("⚠️ preload_text=False → encode text on-the-fly (slower).")
+        # CLIP tokenizer (chỉ cần tokenizer, model sẽ ở trong HME_MC_CLIP)
+        self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
+        print(f"CLIP tokenizer loaded: {clip_model_name}")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.items)
-
-    @torch.no_grad()
-    def _pre_encode_all_text(self) -> Dict[str, torch.Tensor]:
-        cache = {}
-        for item in self.items:
-            qid = item["id"]
-            question = item["question"]
-            choices = item["choices"]
-            texts = [question + " [SEP] " + c for c in choices]
-            emb = self.text_encoder.encode(
-                texts, convert_to_tensor=True, device=self.device, show_progress_bar=False
-            )
-            cache[qid] = emb.float().cpu()
-        return cache
-
-    @torch.no_grad()
-    def encode_text(self, texts: List[str]) -> torch.Tensor:
-        emb = self.text_encoder.encode(texts, convert_to_tensor=True, device=self.device, show_progress_bar=False)
-        return emb.float().cpu()
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
         qid = item["id"]
         question = item["question"]
-        choices = item["choices"]
+        choices = item["choices"]  # List[str]
 
-        # Appearance
-        path_app = os.path.join(self.feature_dir_appearance, f"{qid}.pt")
-        feat_app = torch.load(path_app).squeeze(0) if os.path.exists(path_app) else torch.zeros(768)
-        feat_app = feat_app.float().unsqueeze(0)  # [1, D]
+        # --- Load Appearance (CLIP image) ---
+        path_app = os.path.join(self.feat_app_dir, f"{qid}.npy")
+        if os.path.exists(path_app):
+            feat_app = torch.from_numpy(np.load(path_app)).float()  # [768]
+        else:
+            print(f"Warning: Missing appearance {path_app}, using zero")
+            feat_app = torch.zeros(768)
 
-        # Motion
+        # --- Load Motion (SlowFast) ---
         video_name = os.path.splitext(os.path.basename(item["video_path"]))[0]
-        path_mot = os.path.join(self.feature_dir_motion, f"{video_name}.pt")
+        path_mot = os.path.join(self.feat_mot_dir, f"{video_name}.npy")
         if os.path.exists(path_mot):
-            feat_mot = torch.load(path_mot).float()  # [T, 2304]
+            feat_mot = torch.from_numpy(np.load(path_mot)).float()  # [T, 2304]
         else:
-            feat_mot = torch.zeros((1, 2304))
-        motion_mask = torch.ones(feat_mot.shape[0], dtype=torch.long)
+            print(f"Warning: Missing motion {path_mot}, using zero")
+            feat_mot = torch.zeros(1, 2304)
 
-        # Text
-        if self.preload_text:
-            text_feats = self.text_cache[qid]  # [C, 768]
-        else:
-            texts = [question + " [SEP] " + c for c in choices]
-            text_feats = self.encode_text(texts)
+        motion_mask = torch.ones(feat_mot.shape[0], dtype=torch.bool)
 
-        # Label
+        # --- Label ---
         label = -1
-        if not self.is_test:
-            ans = item.get("answer")
-            if ans:
-                for i, c in enumerate(choices):
-                    if ans.strip() == c.strip():
-                        label = i
-                        break
+        if not self.is_test and "answer" in item:
+            ans = item["answer"]
+            for i, c in enumerate(choices):
+                if ans.strip().lower() == c.strip().lower():
+                    label = i
+                    break
 
         return {
             "id": qid,
-            "appearance_feats": feat_app,  # [1, 768]
-            "motion_feats": feat_mot,      # [T, 2304]
-            "motion_mask": motion_mask,    # [T]
-            "text_feats": text_feats,      # [C, 768]
+            "appearance_feats": feat_app,        # [768]
+            "motion_feats": feat_mot,            # [T, 2304]
+            "motion_mask": motion_mask,          # [T]
             "question": question,
-            "choice_texts": choices,
+            "choices": choices,                  # List[str]
             "label": label
         }
 
+
 # -------------------------
-# Collate
+# Collate Function: Pad motion, không pad text
 # -------------------------
-def collate_fn_hme(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def collate_fn_hme_clip(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch_size = len(batch)
-    # Motion
-    max_T = max(b["motion_feats"].shape[0] for b in batch)
-    motion_feats = torch.zeros((batch_size, max_T, 2304))
-    motion_mask = torch.zeros((batch_size, max_T), dtype=torch.long)
-    for i, b in enumerate(batch):
-        T_b = b["motion_feats"].shape[0]
-        motion_feats[i, :T_b] = b["motion_feats"]
-        motion_mask[i, :T_b] = b["motion_mask"]
 
-    # Appearance
-    appearance_feats = torch.cat([b["appearance_feats"] for b in batch], dim=0)  # [B, 1, 768]
+    # --- Motion: pad to max_T ---
+    motion_list = [b["motion_feats"] for b in batch]
+    max_T = max(m.shape[0] for m in motion_list)
+    motion_padded = torch.zeros(batch_size, max_T, 2304, dtype=torch.float32)
+    motion_mask = torch.zeros(batch_size, max_T, dtype=torch.bool)
 
-    # Text
-    max_C = max(b["text_feats"].shape[0] for b in batch)
-    text_feats = torch.zeros((batch_size, max_C, 768))
-    for i, b in enumerate(batch):
-        C_b = b["text_feats"].shape[0]
-        text_feats[i, :C_b] = b["text_feats"]
+    for i, m in enumerate(motion_list):
+        T = m.shape[0]
+        motion_padded[i, :T] = m
+        motion_mask[i, :T] = 1
 
-    # Labels
+    # --- Appearance: stack ---
+    appearance_feats = torch.stack([b["appearance_feats"] for b in batch])  # [B, 768]
+
+    # --- Text: list of strings ---
+    questions = [b["question"] for b in batch]
+    choices = [b["choices"] for b in batch]
+
+    # --- Labels ---
     labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
 
-    # Raw text
-    questions = [b["question"] for b in batch]
-    choice_texts = [b["choice_texts"] for b in batch]
+    # --- IDs ---
     ids = [b["id"] for b in batch]
 
     return {
         "ids": ids,
-        "appearance_feats": appearance_feats,  # [B,1,768]
-        "motion_feats": motion_feats,          # [B,T,2304]
-        "motion_mask": motion_mask,            # [B,T]
-        "text_feats": text_feats,              # [B,C,768]
-        "labels": labels,
-        "questions": questions,
-        "choice_texts": choice_texts
+        "appearance_feats": appearance_feats,      # [B, 768]
+        "motion_feats": motion_padded,             # [B, T_max, 2304]
+        "motion_mask": motion_mask,                # [B, T_max]
+        "questions": questions,                    # List[str]
+        "choices": choices,                        # List[List[str]]
+        "labels": labels                           # [B]
     }

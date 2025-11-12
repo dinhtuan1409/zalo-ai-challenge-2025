@@ -1,143 +1,156 @@
-# model_v2.py
+# hme_mc_clip.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import CLIPModel, AutoTokenizer
 from typing import Optional
 
-# -------------------------
-# Utility: TransformerEncoder block (simple)
-# -------------------------
-def build_transformer_encoder(dim, num_layers=2, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+def build_transformer_encoder(dim, num_layers=2, num_heads=8, dropout=0.1):
     encoder_layer = nn.TransformerEncoderLayer(
-        d_model=dim,
-        nhead=num_heads,
-        dim_feedforward=int(dim * mlp_ratio),
-        dropout=dropout,
-        activation="gelu",
-        batch_first=True,  # (B, S, D)
+        d_model=dim, nhead=num_heads, dim_feedforward=dim*4,
+        dropout=dropout, activation="gelu", batch_first=True
     )
     return nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-# -------------------------
-# HME-style Multi-choice VideoQA with Memory + Iterative Reasoning
-# -------------------------
+# --- Dynamic Memory Module ---
+class DynamicMemory(nn.Module):
+    def __init__(self, memory_size, dim):
+        super().__init__()
+        self.memory = nn.Parameter(torch.randn(memory_size, dim) * 0.02)
+        self.proj = nn.Linear(dim, dim)
+        self.gate = nn.Sequential(nn.Linear(dim, 1), nn.Sigmoid())
+
+    def forward(self, feats):  # [B, T, D]
+        B, T, D = feats.shape
+        mem = self.memory.unsqueeze(0).expand(B, -1, -1)
+
+        # Read
+        keys = self.proj(feats)
+        attn = F.softmax(torch.bmm(keys, mem.transpose(1,2)) / (D**0.5), dim=-1)
+        read = torch.bmm(attn, mem)
+
+        # Write (EMA)
+        write = attn.mean(1)
+        gate = self.gate(feats.mean(1))
+        new_mem = mem + gate.unsqueeze(1) * write.unsqueeze(2)
+        return read, new_mem
+
+# --- HME-MC v3 (CLIP-Aligned) ---
 class HME_MC(nn.Module):
     def __init__(
         self,
-        motion_dim: int = 2304,
-        appearance_dim: int = 768,
-        text_dim: int = 768,
-        hidden_dim: int = 1024,
-        motion_proj_dim: int = 1024,
-        num_motion_layers: int = 2,
-        motion_heads: int = 8,
-        fusion_heads: int = 8,
-        reasoning_steps: int = 2,
-        memory_size: int = 5,
-        dropout: float = 0.1,
-        use_mean_pool_motion: bool = False
+        motion_dim=2304,
+        clip_dim=768,
+        hidden_dim=1024,
+        proj_dim=768,           # CLIP space
+        memory_size=8,
+        reasoning_steps=3,
+        clip_model_name="openai/clip-vit-base-patch32",
+        freeze_clip=True
     ):
         super().__init__()
-        self.motion_dim = motion_dim
-        self.appearance_dim = appearance_dim
-        self.text_dim = text_dim
-        self.hidden_dim = hidden_dim
-        self.motion_proj_dim = motion_proj_dim
+        self.proj_dim = proj_dim
         self.reasoning_steps = reasoning_steps
-        self.use_mean_pool_motion = use_mean_pool_motion
-        self.memory_size = memory_size
 
-        # --- project raw features ---
-        self.motion_proj = nn.Linear(motion_dim, motion_proj_dim)
-        self.motion_ln = nn.LayerNorm(motion_proj_dim)
-        self.motion_encoder = build_transformer_encoder(motion_proj_dim, num_motion_layers, motion_heads, dropout=dropout)
+        # --- CLIP Model (frozen) ---
+        self.clip_model = CLIPModel.from_pretrained(clip_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(clip_model_name)
+        if freeze_clip:
+            for p in self.clip_model.parameters():
+                p.requires_grad = False
 
-        self.appearance_proj = nn.Linear(appearance_dim, motion_proj_dim)
-        self.appearance_ln = nn.LayerNorm(motion_proj_dim)
-
-        self.text_proj = nn.Linear(text_dim, motion_proj_dim)
-        self.text_ln = nn.LayerNorm(motion_proj_dim)
-
-        # --- memory modules ---
-        self.appearance_memory = nn.Parameter(torch.zeros(memory_size, motion_proj_dim))
-        self.motion_memory = nn.Parameter(torch.zeros(memory_size, motion_proj_dim))
-
-        # --- cross attention: text queries attend video+memory ---
-        self.cross_attn = nn.MultiheadAttention(embed_dim=motion_proj_dim, num_heads=fusion_heads, dropout=dropout, batch_first=True)
-        self.cross_attn_ln = nn.LayerNorm(motion_proj_dim)
-
-        # --- fusion feed-forward ---
-        self.fusion_ff = nn.Sequential(
-            nn.Linear(motion_proj_dim, motion_proj_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(motion_proj_dim, motion_proj_dim)
+        # --- Project Motion to CLIP space ---
+        self.motion_proj = nn.Sequential(
+            nn.Linear(motion_dim, proj_dim),
+            nn.LayerNorm(proj_dim),
+            nn.GELU()
         )
-        self.fusion_ln = nn.LayerNorm(motion_proj_dim)
 
-        # --- final classifier ---
-        self.classifier = nn.Sequential(
-            nn.Linear(motion_proj_dim * 2, hidden_dim),
+        # --- Motion Temporal Encoder ---
+        self.motion_encoder = build_transformer_encoder(proj_dim, num_layers=2)
+
+        # --- Dynamic Memories (in CLIP space) ---
+        self.app_memory = DynamicMemory(memory_size, proj_dim)
+        self.mot_memory = DynamicMemory(memory_size, proj_dim)
+
+        # --- Cross Attention (text query video) ---
+        self.cross_attn = nn.MultiheadAttention(proj_dim, num_heads=8, batch_first=True, dropout=0.1)
+        self.norm_attn = nn.LayerNorm(proj_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim*4),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.1),
+            nn.Linear(proj_dim*4, proj_dim)
+        )
+        self.norm_ffn = nn.LayerNorm(proj_dim)
+
+        # --- Classifier ---
+        self.classifier = nn.Sequential(
+            nn.Linear(proj_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, 1)
         )
 
+    def encode_text(self, questions, answers):
+        # questions: [B], answers: [B, C]
+        B, C = answers.shape[0], answers.shape[1]
+        texts = [f"{q} {a}" for q in questions for a in answers[q]]
+        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=77).to(next(self.clip_model.parameters()).device)
+        with torch.no_grad():
+            text_feats = self.clip_model.get_text_features(**inputs)  # [B*C, 768]
+        return text_feats
+
     def forward(
         self,
-        motion_feats: torch.Tensor,         # [B, T, D_m]
-        motion_mask: Optional[torch.Tensor],# [B, T]
-        appearance_feats: torch.Tensor,     # [B, D_a]
-        text_feats: torch.Tensor,           # [B, C, D_t]
+        motion_feats: torch.Tensor,      # [B, T, 2304] from SlowFast
+        motion_mask: Optional[torch.Tensor],
+        clip_img_feats: torch.Tensor,    # [B, 768] from CLIP (global pool)
+        questions: list,                 # [B] strings
+        answers: list,                   # [B, C] strings
         labels: Optional[torch.Tensor] = None
     ):
         B, device = motion_feats.size(0), motion_feats.device
 
-        # --- project features ---
-        mot = self.motion_ln(self.motion_proj(motion_feats))
-        app = self.appearance_ln(self.appearance_proj(appearance_feats))
-        txt = self.text_ln(self.text_proj(text_feats))
+        # --- 1. Project motion to CLIP space ---
+        mot = self.motion_proj(motion_feats)  # [B, T, 768]
 
-        # --- motion temporal encoder ---
-        if self.use_mean_pool_motion:
-            if motion_mask is not None:
-                denom = motion_mask.sum(dim=1, keepdim=True).clamp(min=1).to(mot.dtype)
-                mot_tokens = ((mot * motion_mask.unsqueeze(-1)).sum(dim=1) / denom).unsqueeze(1)
-            else:
-                mot_tokens = mot.mean(dim=1, keepdim=True)
+        # --- 2. Motion Encoder ---
+        if motion_mask is not None:
+            key_padding_mask = (motion_mask == 0)
         else:
-            key_padding_mask = (motion_mask == 0) if motion_mask is not None else None
-            mot_tokens = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)
+            key_padding_mask = None
+        mot_tokens = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)  # [B, T, 768]
 
-        # --- add appearance token ---
-        app_tok = app.unsqueeze(1)
-        video_tokens = torch.cat([app_tok, mot_tokens], dim=1)
-        video_mask = torch.ones((B, video_tokens.size(1)), dtype=torch.long, device=device)
+        # --- 3. Dynamic Memory Read ---
+        mot_read, _ = self.mot_memory(mot_tokens)
+        app_read, _ = self.app_memory(clip_img_feats.unsqueeze(1).expand(-1, mot_tokens.size(1), -1))
 
-        # --- iterative reasoning over memory ---
-        mem_app = self.appearance_memory.unsqueeze(0).expand(B, -1, -1)
-        mem_mot = self.motion_memory.unsqueeze(0).expand(B, -1, -1)
-        video_tokens = torch.cat([video_tokens, mem_app, mem_mot], dim=1)
-        video_mask = torch.cat([video_mask, torch.ones((B, mem_app.size(1)+mem_mot.size(1)), device=device)], dim=1)
+        # --- 4. Video Tokens: motion + memory ---
+        video_tokens = torch.cat([mot_tokens, mot_read, app_read], dim=1)  # [B, 3T, 768]
+        video_mask = torch.ones(B, video_tokens.size(1), device=device, dtype=torch.long)
 
-        B, C, M = txt.shape
-        queries = txt.view(B*C, 1, M)
-        keys = video_tokens.repeat_interleave(C, dim=0)
-        key_padding_mask = (video_mask == 0).repeat_interleave(C, dim=0)
+        # --- 5. Encode Text (CLIP) ---
+        text_feats = self.encode_text(questions, answers)  # [B*C, 768]
+        queries = text_feats.unsqueeze(1)  # [B*C, 1, 768]
 
-        # iterative cross-attention
+        # --- 6. Repeat video for each choice ---
+        keys = video_tokens.repeat_interleave(len(answers[0]), dim=0)
+        key_padding_mask = video_mask.repeat_interleave(len(answers[0]), dim=0)
+
+        # --- 7. Iterative Reasoning ---
         x = queries
         for _ in range(self.reasoning_steps):
             attn_out, _ = self.cross_attn(x, keys, keys, key_padding_mask=key_padding_mask)
-            x = self.cross_attn_ln(x + attn_out)
-            x = self.fusion_ln(self.fusion_ff(x))
+            x = self.norm_attn(x + attn_out)
+            x = self.norm_ffn(x + self.ffn(x))
 
-        # --- combine text and fused video-attended ---
-        combined = torch.cat([queries, x], dim=-1).squeeze(1)
-        logits = self.classifier(combined).view(B, C)
+        # --- 8. Classification ---
+        combined = torch.cat([queries, x], dim=-1).squeeze(1)  # [B*C, 1536]
+        logits = self.classifier(combined).view(B, -1)  # [B, C]
 
         output = {"logits": logits}
         if labels is not None:
-            loss = F.cross_entropy(logits, labels)
+            loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
             output["loss"] = loss
         return output
