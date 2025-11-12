@@ -97,7 +97,7 @@ def collate_fn_hme_clip(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     for i, m in enumerate(motion_list):
         T = m.shape[0]
         motion_padded[i, :T] = m
-        motion_mask[i, :T] = 1
+        motion_mask[i, :T] = True
 
     # --- Appearance: stack ---
     appearance_feats = torch.stack([b["appearance_feats"] for b in batch])  # [B, 768]
