@@ -13,8 +13,7 @@ os.environ["TRANSFORMERS_NO_ADDITIONAL_CHAT_TEMPLATES"] = "1"
 # ===========================================================
 def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
     model = SentenceTransformer(
-        "sentence-transformers/all-mpnet-base-v2",
-        trust_remote_code=True
+        "sentence-transformers/all-mpnet-base-v2"
     )
     model.eval()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
