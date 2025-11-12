@@ -1,5 +1,6 @@
-# train_optimized.py
+# train.py
 import os
+import math
 import random
 import json
 import argparse
@@ -12,40 +13,40 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 
+# --- import your modules (adjust paths/names if needed) ---
 from model import HME_MC
-from dataset import FeatureVideoQAHME_MC, load_text_encoder, collate_fn_hme
+from dataset import FeatureVideoQAHME_MC, load_text_encoder,collate_fn_hme
 
 # -------------------------
-# Default hyperparameters
+# Config / Hyperparameters
 # -------------------------
 def get_default_args():
     return {
         "data_json": "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/train/train.json",
-        "feat_app_dir": "/kaggle/working/feature_motion_appeare/train_appear",
-        "feat_mot_dir": "/kaggle/working/feature_motion_appeare/train_motion",
-        "output_dir": "/kaggle/working/hme_ckpt_optimized",
-        "batch_size": 8,           # tăng batch size
-        "accum_steps": 1,          # giảm accumulation
-        "epochs": 50,              # tăng epochs
+        "feat_app_dir": "/kaggle/working/feature_motion_appeare/train_appear",   # appearance .pt by id
+        "feat_mot_dir": "/kaggle/working/feature_motion_appeare/train_motion", # motion .pt by video name
+        "output_dir": "/kaggle/working/hme_ckpt",
+        "batch_size": 4,
+        "accum_steps": 4,
+        "epochs": 10,
         "lr": 1e-4,
-        "weight_decay": 5e-3,
-        "valid_split": 0.1,        # tăng valid split
+        "weight_decay": 1e-2,
+        "valid_split": 0.05,
         "seed": 42,
         "use_fp16": True,
-        "earlystop_patience": 6,
-        "num_workers": 8,
+        "earlystop_patience": 3,
+        "num_workers": 4,
         "motion_dim": 2304,
         "appearance_dim": 768,
         "text_dim": 768,
         "motion_proj_dim": 1024,
         "hidden_dim": 1024,
-        "num_motion_layers": 3,    # tăng số layers motion encoder
-        "dropout": 0.1,
+        "num_motion_layers": 2,
         "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
 
 # -------------------------
-# Seed utility
+# Utility: seed
 # -------------------------
 def seed_everything(seed: int):
     random.seed(seed)
@@ -54,19 +55,23 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 # -------------------------
-# Evaluation
+# Evaluate
 # -------------------------
 def evaluate(model: nn.Module, loader: DataLoader, device: str, use_fp16: bool) -> Tuple[float, float]:
     model.eval()
-    total_loss, total_correct, total_count = 0.0, 0, 0
+    total_loss = 0.0
+    total_correct = 0
+    total_count = 0
     loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Eval", leave=False):
-            appearance = batch["appearance_feats"].to(device)
-            motion = batch["motion_feats"].to(device)
-            text = batch["text_feats"].to(device)
-            mask_motion = batch.get("motion_mask", None)
+        pbar = tqdm(loader, desc="Eval", leave=False)
+        for batch in pbar:
+            # unpack
+            appearance = batch["appearance_feats"].to(device)   # [B, 768]
+            motion = batch["motion_feats"].to(device)          # [B, T, 2304]
+            text = batch["text_feats"].to(device)              # [B, C, 768]
+            mask_motion = batch.get("mask_motion", None)
             if mask_motion is not None:
                 mask_motion = mask_motion.to(device)
             labels = batch.get("labels", None)
@@ -82,17 +87,24 @@ def evaluate(model: nn.Module, loader: DataLoader, device: str, use_fp16: bool) 
                     labels=labels if (labels is not None and (labels!=-1).any()) else None
                 )
                 logits = out["logits"]
-                loss = loss_fn(logits, labels) if labels is not None else torch.tensor(0.0, device=device)
+                if labels is not None:
+                    loss = loss_fn(logits, labels)
+                else:
+                    loss = torch.tensor(0.0, device=device)
 
-            total_loss += loss.item() * appearance.size(0)
+            batch_size = appearance.size(0)
+            total_loss += loss.item() * batch_size
 
+            # accuracy (ignore -1)
             if labels is not None:
                 valid_mask = labels != -1
-                total_correct += (logits.argmax(dim=1)[valid_mask] == labels[valid_mask]).sum().item()
-                total_count += valid_mask.sum().item()
+                if valid_mask.sum() > 0:
+                    preds = logits.argmax(dim=1)
+                    total_correct += (preds[valid_mask] == labels[valid_mask]).sum().item()
+                    total_count += int(valid_mask.sum().item())
 
     avg_loss = total_loss / len(loader.dataset)
-    avg_acc = total_correct / total_count if total_count > 0 else 0.0
+    avg_acc = (total_correct / total_count) if total_count > 0 else 0.0
     return avg_loss, avg_acc
 
 # -------------------------
@@ -102,9 +114,15 @@ def train_loop(args):
     seed_everything(args["seed"])
     device = args["device"]
 
-    print("Loading MPNet text encoder...")
-    mpnet = load_text_encoder(device="cpu")
+    # --------------------------
+    # Text encoder used by dataset (MPNet)
+    # --------------------------
+    print("Loading MPNet text encoder (for dataset preprocessing)...")
+    mpnet = load_text_encoder(device="cpu")  # dataset loads text on CPU and caches to CPU
 
+    # --------------------------
+    # Dataset & DataLoader
+    # --------------------------
     print("Preparing dataset...")
     full_ds = FeatureVideoQAHME_MC(
         json_path=args["data_json"],
@@ -115,7 +133,6 @@ def train_loop(args):
         is_test=False
     )
 
-    # Split train/val
     n = len(full_ds)
     n_val = max(1, int(n * args["valid_split"]))
     indices = list(range(n))
@@ -131,17 +148,20 @@ def train_loop(args):
         shuffle=True,
         num_workers=args["num_workers"],
         pin_memory=True,
-        collate_fn=collate_fn_hme
+        collate_fn=collate_fn_hme_mc
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=args["batch_size"],
+        batch_size=max(1, args["batch_size"]//1),
         shuffle=False,
         num_workers=args["num_workers"],
         pin_memory=True,
-        collate_fn=collate_fn_hme
+        collate_fn=collate_fn_hme_mc
     )
 
+    # --------------------------
+    # Build model
+    # --------------------------
     print("Building HME_MC model...")
     model = HME_MC(
         motion_dim=args["motion_dim"],
@@ -149,20 +169,21 @@ def train_loop(args):
         text_dim=args["text_dim"],
         hidden_dim=args["hidden_dim"],
         motion_proj_dim=args["motion_proj_dim"],
-        num_motion_layers=args["num_motion_layers"],
-        fusion_heads=8,
-        motion_heads=8,
-        dropout=args["dropout"],
-        use_mean_pool_motion=False,  # multi-scale pooling
-        treat_text_as_query=True
+        num_motion_layers=args["num_motion_layers"]
     ).to(device)
 
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                  lr=args["lr"], weight_decay=args["weight_decay"])
+    # --------------------------
+    # Optimizer & Scheduler & Scaler
+    # --------------------------
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args["lr"], weight_decay=args["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1, verbose=True)
     scaler = GradScaler(enabled=args["use_fp16"])
     loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
 
+    # --------------------------
+    # Training
+    # --------------------------
     best_val_loss = float("inf")
     epochs_no_improve = 0
     os.makedirs(args["output_dir"], exist_ok=True)
@@ -170,13 +191,15 @@ def train_loop(args):
     print("Start training...")
     for epoch in range(args["epochs"]):
         model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args['epochs']} train")
         running_loss = 0.0
         optimizer.zero_grad()
-        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args['epochs']} train")):
-            appearance = batch["appearance_feats"].to(device)
-            motion = batch["motion_feats"].to(device)
-            text = batch["text_feats"].to(device)
-            mask_motion = batch.get("motion_mask", None)
+
+        for step, batch in enumerate(pbar):
+            appearance = batch["appearance_feats"].to(device)    # [B,768]
+            motion = batch["motion_feats"].to(device)           # [B,T,2304]
+            text = batch["text_feats"].to(device)               # [B,C,768]
+            mask_motion = batch.get("mask_motion", None)
             if mask_motion is not None:
                 mask_motion = mask_motion.to(device)
             labels = batch.get("labels", None)
@@ -193,25 +216,27 @@ def train_loop(args):
                 )
                 logits = out["logits"]
                 loss = loss_fn(logits, labels)
+
                 loss_to_back = loss / args["accum_steps"]
 
             scaler.scale(loss_to_back).backward()
 
             if (step + 1) % args["accum_steps"] == 0 or (step + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
             running_loss += loss.item()
-            tqdm.write(f"Step {step+1}, Loss: {running_loss/(step+1):.4f}")
+            pbar.set_postfix({"loss": f"{running_loss / (step + 1):.4f}"})
 
+        # Validation
         val_loss, val_acc = evaluate(model, val_loader, device, args["use_fp16"])
         print(f"Epoch {epoch+1} - val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}")
         scheduler.step(val_loss)
 
-        # Save best model
+        # Save best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -227,11 +252,13 @@ def train_loop(args):
             print(f"Saved best_model.pt (val_loss={val_loss:.4f})")
         else:
             epochs_no_improve += 1
+            print(f"No improvement ({epochs_no_improve}/{args['earlystop_patience']})")
             if epochs_no_improve >= args["earlystop_patience"]:
                 print("Early stopping triggered.")
                 break
 
     print("Training finished.")
+    # Save final checkpoint
     torch.save({
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -250,6 +277,7 @@ if __name__ == "__main__":
     for k, v in default_args.items():
         parser.add_argument(f"--{k}", type=type(v), default=v)
     parsed = vars(parser.parse_args())
+    # Ensure types for booleans etc.
     parsed["use_fp16"] = bool(parsed["use_fp16"])
     parsed["seed"] = int(parsed["seed"])
     parsed["device"] = parsed["device"]
