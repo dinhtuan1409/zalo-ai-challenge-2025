@@ -44,18 +44,18 @@ class FeatureVideoQAHME_CLIP(Dataset):
         choices = item["choices"]  # List[str]
 
         # --- Load Appearance (CLIP image) ---
-        path_app = os.path.join(self.feat_app_dir, f"{qid}.npy")
+        path_app = os.path.join(self.feature_dir_appearance, f"{qid}_appearance.pt")
         if os.path.exists(path_app):
-            feat_app = torch.from_numpy(np.load(path_app)).float()  # [768]
+            feat_app = torch.load(path_app).squeeze(0)  # [768]
         else:
             print(f"Warning: Missing appearance {path_app}, using zero")
             feat_app = torch.zeros(768)
 
         # --- Load Motion (SlowFast) ---
         video_name = os.path.splitext(os.path.basename(item["video_path"]))[0]
-        path_mot = os.path.join(self.feat_mot_dir, f"{video_name}.npy")
+        path_mot = os.path.join(self.feature_dir_motion, f"{video_name}.pt")
         if os.path.exists(path_mot):
-            feat_mot = torch.from_numpy(np.load(path_mot)).float()  # [T, 2304]
+            feat_mot = torch.load(path_mot).float()  # [T, 2304]
         else:
             print(f"Warning: Missing motion {path_mot}, using zero")
             feat_mot = torch.zeros(1, 2304)
