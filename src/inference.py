@@ -1,4 +1,4 @@
-# inference_hme_simple.py
+# inference_hme_trainstyle.py
 import os
 import json
 import torch
@@ -10,10 +10,11 @@ from dataset_test import FeatureVideoQAHME_MC, collate_fn_hme, load_text_encoder
 from model import HME_MC
 
 
-def run_inference_hme_simple(
+def inference_hme_trainstyle(
     json_path: str,
     feature_dir_app: str,
     feature_dir_mot: str,
+    checkpoint_path: str,
     output_file: str,
     batch_size: int = 16,
     use_fp16: bool = True,
@@ -21,7 +22,9 @@ def run_inference_hme_simple(
     appearance_dim: int = 768,
     text_dim: int = 768,
     motion_proj_dim: int = 1024,
-    num_workers: int = None,
+    hidden_dim: int = 1024,
+    num_motion_layers: int = 2,
+    num_workers: int = None
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers = num_workers or os.cpu_count()
@@ -30,19 +33,30 @@ def run_inference_hme_simple(
     print("🔄 Loading text encoder...")
     text_encoder = load_text_encoder(device=device)
 
-    # --- Build HME_MC model ---
+    # --- Build model ---
     print("🔄 Building HME_MC model...")
     model = HME_MC(
         motion_dim=motion_dim,
         appearance_dim=appearance_dim,
         text_dim=text_dim,
-        motion_proj_dim=motion_proj_dim
+        hidden_dim=hidden_dim,
+        motion_proj_dim=motion_proj_dim,
+        num_motion_layers=num_motion_layers
     ).to(device)
+
+    # --- Load checkpoint ---
+    if os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"✅ Loaded checkpoint from {checkpoint_path}")
+    else:
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
     model.eval()
 
-    # --- Load test dataset ---
-    print("🔄 Loading test dataset...")
-    test_ds = FeatureVideoQAHME_MC(
+    # --- Load dataset ---
+    print("🔄 Loading dataset...")
+    dataset = FeatureVideoQAHME_MC(
         json_path=json_path,
         feature_dir_appearance=feature_dir_app,
         feature_dir_motion=feature_dir_mot,
@@ -51,8 +65,8 @@ def run_inference_hme_simple(
         is_test=True
     )
 
-    test_loader = DataLoader(
-        test_ds,
+    loader = DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn_hme,
@@ -60,17 +74,19 @@ def run_inference_hme_simple(
         pin_memory=True
     )
 
-    # --- Inference loop ---
+    # --- Inference ---
     results = []
+
     with torch.no_grad():
-        pbar = tqdm(test_loader, desc="🚀 Inference")
+        pbar = tqdm(loader, desc="🚀 Inference")
         for batch in pbar:
-            motion_feats = batch["motion_feats"].to(device)
-            motion_mask = batch["motion_mask"].to(device)
-            appearance_feats = batch["appearance_feats"].to(device)
-            text_feats = batch["text_feats"].to(device)
+            motion_feats = batch["motion_feats"].to(device)       # [B, T, 2304]
+            motion_mask = batch["motion_mask"].to(device)         # [B, T]
+            appearance_feats = batch["appearance_feats"].to(device)  # [B, 768]
+            text_feats = batch["text_feats"].to(device)           # [B, C, 768]
             ids = batch["ids"]
 
+            # FP16 autocast
             with autocast(enabled=use_fp16):
                 out = model(
                     motion_feats=motion_feats,
@@ -79,7 +95,7 @@ def run_inference_hme_simple(
                     text_feats=text_feats
                 )
 
-            logits = out["logits"]          # [B, C]
+            logits = out["logits"]    # [B, C]
             preds = logits.argmax(dim=1).cpu().tolist()
 
             for qid, p in zip(ids, preds):
@@ -95,11 +111,11 @@ def run_inference_hme_simple(
 
 
 if __name__ == "__main__":
-    # Ví dụ chạy
-    run_inference_hme_simple(
+    inference_hme_trainstyle(
         json_path="/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/public_test/public_test.json",
         feature_dir_app="/kaggle/working/feature_motion_appeare/test_appear",
         feature_dir_mot="/kaggle/working/feature_motion_appeare/test_motion",
+        checkpoint_path="/kaggle/working/hme_ckpt/best_model.pt",
         output_file="/kaggle/working/submission.json",
         batch_size=16
     )
