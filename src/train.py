@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Subset, Dataset
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 from model import HME_MC
-from dataset import FeatureVideoQAHME_CLIP, collate_fn_hme_clip
+from dataset import FeatureVideoQAHME_CLIP,collate_fn_hme_clip
 # -------------------------
 # Default hyperparameters
 # -------------------------
@@ -104,7 +104,8 @@ def train_loop(args):
         json_path=args["data_json"],
         feature_dir_appearance=args["feat_app_dir"],
         feature_dir_motion=args["feat_mot_dir"],
-        preload_text=True
+        clip_model_name=args["clip_model_name"],
+        is_test=False
     )
 
     # Split
