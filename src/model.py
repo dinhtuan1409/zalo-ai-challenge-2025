@@ -45,7 +45,7 @@ class HME_MC(nn.Module):
         proj_dim=768,
         memory_size=8,
         reasoning_steps=3,
-        clip_model_name="openai/clip-vit-base-patch32",
+        clip_model_name="openai/clip-vit-large-patch14-336",
         freeze_clip=True
     ):
         super().__init__()
