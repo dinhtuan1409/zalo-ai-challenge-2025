@@ -44,6 +44,7 @@ class FeatureVideoQAHME_CLIP(Dataset):
         choices = item["choices"]  # List[str]
 
         # --- Load Appearance (CLIP image) ---
+        print(self.feature_dir_appearance,"tuan")
         path_app = os.path.join(self.feature_dir_appearance, f"{qid}.pt")
         if os.path.exists(path_app):
             feat_app = torch.load(path_app).squeeze(0)  # [768]
