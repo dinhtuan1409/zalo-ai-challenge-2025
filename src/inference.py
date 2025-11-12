@@ -147,7 +147,7 @@ if __name__ == "__main__":
         json_path="/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/public_test/public_test.json",
         feature_dir_app="/kaggle/working/feature_motion_appeare/test_appear",
         feature_dir_mot="/kaggle/working/feature_motion_appeare/test_motion",
-        checkpoint_path="/kaggle/working/hme_ckpt/best_model.pt",
+        checkpoint_path="/kaggle/working/hme_clip_ckpt/best_model.pt",
         output_file="/kaggle/working/submission_optimized.json",
         batch_size=16
     )
