@@ -1,4 +1,4 @@
-# train.py
+# train.py - 60 train
 import os
 import math
 import random
