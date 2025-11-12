@@ -29,7 +29,7 @@ def get_default_args():
         "batch_size": 4,
         "accum_steps": 4,
         "epochs": 30,
-        "lr": 1e-4,
+        "lr": 3e-4,
         "weight_decay": 1e-2,
         "valid_split": 0.1,
         "seed": 42,
