@@ -249,7 +249,7 @@ class FeatureVideoQAHME_MC(Dataset):
         else:
             feat_mot = torch.zeros((1, 2304))
 
-       motion_mask = torch.ones(feat_mot.shape[0], dtype=torch.bool) 
+        motion_mask = torch.ones(feat_mot.shape[0], dtype=torch.bool) 
 
         # Text feature
         if self.preload_text:
