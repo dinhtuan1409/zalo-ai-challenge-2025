@@ -106,7 +106,7 @@ def train_loop(args):
     # --- Load encoders ---
     print("Loading MPNet + Video-LLaVA encoders...")
     mpnet = load_text_encoder(device=device)
-    vllava_model, vllava_tokenizer, vllava_processor = load_video_llava(device=device)
+    vllava_model, vllava_processor = load_video_llava(device=device)
 
     # --- Load frames dict (video_name -> list of PIL.Image frames) ---
     # Bạn cần chuẩn bị dict frames_dict trước
