@@ -15,7 +15,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 # --- import your modules (adjust paths/names if needed) ---
 from model import HME_MC
-from dataset import FeatureVideoQAHME_MC, load_text_encoder,collate_fn_hme
+from dataset import FeatureVideoQAHME_MC, load_text_encoder,collate_fn_hme_mc
 
 # -------------------------
 # Config / Hyperparameters
@@ -148,7 +148,7 @@ def train_loop(args):
         shuffle=True,
         num_workers=args["num_workers"],
         pin_memory=True,
-        collate_fn=collate_fn_hme
+        collate_fn=collate_fn_hme_mc
     )
     val_loader = DataLoader(
         val_ds,
@@ -156,7 +156,7 @@ def train_loop(args):
         shuffle=False,
         num_workers=args["num_workers"],
         pin_memory=True,
-        collate_fn=collate_fn_hme
+        collate_fn=collate_fn_hme_mc
     )
 
     # --------------------------
