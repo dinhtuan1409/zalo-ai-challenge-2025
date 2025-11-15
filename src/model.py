@@ -122,3 +122,24 @@ def contrastive_loss(video_emb: torch.Tensor, text_emb: torch.Tensor, temperatur
     loss_v2t = F.cross_entropy(logits, labels)
     loss_t2v = F.cross_entropy(logits.T, labels)
     return (loss_v2t + loss_t2v) / 2.0
+
+
+class VideoTextContrastive(nn.Module):
+    def __init__(self, video_dim=1024, text_dim=768, temperature=0.07):
+        super().__init__()
+        self.video_dim = video_dim
+        self.text_dim = text_dim
+        self.temperature = temperature
+        # Linear projection text -> video_dim
+        self.text_proj = nn.Linear(text_dim, video_dim)
+
+    def forward(self, video_emb: torch.Tensor, text_emb: torch.Tensor):
+        # normalize embeddings
+        video_emb = F.normalize(video_emb, dim=-1)           # [B, video_dim]
+        text_emb = F.normalize(self.text_proj(text_emb), dim=-1)  # [B, video_dim]
+
+        logits = video_emb @ text_emb.T / self.temperature   # [B, B]
+        labels = torch.arange(video_emb.size(0), device=video_emb.device)
+        loss_v2t = F.cross_entropy(logits, labels)
+        loss_t2v = F.cross_entropy(logits.T, labels)
+        return (loss_v2t + loss_t2v) / 2.0
