@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 # --- import your modules ---
 from model import VideoEncoder, contrastive_loss
-from dataset import FeatureVideoQAHME_MC_CLIP, CLIPTextEncoder, collate_fn_hme_clip
+from dataset import FeatureVideoQAHME_MC_LLMAssist, CLIPTextEncoder, collate_fn_hme_clip
 
 # -------------------------
 # Config / Hyperparameters
@@ -104,7 +104,7 @@ def train_loop(args):
     # Dataset & DataLoader
     # --------------------------
     print("Preparing dataset...")
-    full_ds = FeatureVideoQAHME_MC_CLIP(
+    full_ds = FeatureVideoQAHME_MC_LLMAssist(
         json_path=args["data_json"],
         feature_dir_appearance=args["feat_app_dir"],
         feature_dir_motion=args["feat_mot_dir"],
