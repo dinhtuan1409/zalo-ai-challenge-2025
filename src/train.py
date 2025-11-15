@@ -14,7 +14,7 @@ from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 
 # --- import your modules (adjust paths/names if needed) ---
-from model import HME_MC
+from model import SimpleVideoQAMC
 from dataset import FeatureVideoQAHME_MC_CLIP, CLIPTextEncoder,collate_fn_hme_clip
 
 # -------------------------
@@ -163,7 +163,7 @@ def train_loop(args):
     # Build model
     # --------------------------
     print("Building HME_MC model...")
-    model = HME_MC(
+    model = SimpleVideoQAMC(
         motion_dim=args["motion_dim"],
         appearance_dim=args["appearance_dim"],
         text_dim=args["text_dim"],
