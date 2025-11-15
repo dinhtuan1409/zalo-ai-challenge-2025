@@ -106,7 +106,7 @@ def train_loop(args):
     # --- Load encoders ---
     print("Loading MPNet + CLIP encoders...")
     mpnet = load_text_encoder(device="cpu")
-    clip_model, clip_preprocess = load_clip_encoder(model_name="ViT-L/14@336px", device="cpu")
+    clip_model, clip_preprocess = load_clip_encoder( device="cpu")
 
     # --- Dataset ---
     print("Preparing dataset...")
