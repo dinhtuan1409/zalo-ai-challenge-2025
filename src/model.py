@@ -1,146 +1,262 @@
-# model.py
+# train_optimized.py
+import os
+import random
+import json
+import argparse
+from typing import Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+
+from model import HME_MC
+from dataset import FeatureVideoQAHME_MC, load_text_encoder, collate_fn_hme
 
 # -------------------------
-# Utility: TransformerEncoder block
+# Default hyperparameters
 # -------------------------
-def build_transformer_encoder(dim, num_layers=2, num_heads=8, mlp_ratio=4.0, dropout=0.1):
-    """
-    Simple Transformer encoder (motion temporal modeling)
-    """
-    encoder_layer = nn.TransformerEncoderLayer(
-        d_model=dim,
-        nhead=num_heads,
-        dim_feedforward=int(dim * mlp_ratio),
-        dropout=dropout,
-        activation="gelu",
-        batch_first=True  # input shape: [B, S, D]
+def get_default_args():
+    return {
+        "data_json": "/kaggle/input/zalo-ai-challenge-2025-roadbuddy/traffic_buddy_train+public_test/train/train.json",
+        "feat_app_dir": "/kaggle/working/feature_motion_appeare/train_appear",
+        "feat_mot_dir": "/kaggle/working/feature_motion_appeare/train_motion",
+        "output_dir": "/kaggle/working/hme_ckpt_optimized",
+        "batch_size": 8,           # tăng batch size
+        "accum_steps": 1,          # giảm accumulation
+        "epochs": 50,              # tăng epochs
+        "lr": 1e-4,
+        "weight_decay": 5e-3,
+        "valid_split": 0.1,        # tăng valid split
+        "seed": 42,
+        "use_fp16": True,
+        "earlystop_patience": 6,
+        "num_workers": 8,
+        "motion_dim": 2304,
+        "appearance_dim": 768,
+        "text_dim": 768,
+        "motion_proj_dim": 1024,
+        "hidden_dim": 1024,
+        "num_motion_layers": 3,    # tăng số layers motion encoder
+        "dropout": 0.1,
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
+
+# -------------------------
+# Seed utility
+# -------------------------
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+# -------------------------
+# Evaluation
+# -------------------------
+def evaluate(model: nn.Module, loader: DataLoader, device: str, use_fp16: bool) -> Tuple[float, float]:
+    model.eval()
+    total_loss, total_correct, total_count = 0.0, 0, 0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Eval", leave=False):
+            appearance = batch["appearance_feats"].to(device)
+            motion = batch["motion_feats"].to(device)
+            text = batch["text_feats"].to(device)
+            mask_motion = batch.get("motion_mask", None)
+            if mask_motion is not None:
+                mask_motion = mask_motion.to(device)
+            labels = batch.get("labels", None)
+            if labels is not None:
+                labels = labels.to(device)
+
+            with autocast(enabled=use_fp16):
+                out = model(
+                    motion_feats=motion,
+                    motion_mask=mask_motion,
+                    appearance_feats=appearance,
+                    text_feats=text,
+                    labels=labels if (labels is not None and (labels!=-1).any()) else None
+                )
+                logits = out["logits"]
+                loss = loss_fn(logits, labels) if labels is not None else torch.tensor(0.0, device=device)
+
+            total_loss += loss.item() * appearance.size(0)
+
+            if labels is not None:
+                valid_mask = labels != -1
+                total_correct += (logits.argmax(dim=1)[valid_mask] == labels[valid_mask]).sum().item()
+                total_count += valid_mask.sum().item()
+
+    avg_loss = total_loss / len(loader.dataset)
+    avg_acc = total_correct / total_count if total_count > 0 else 0.0
+    return avg_loss, avg_acc
+
+# -------------------------
+# Training loop
+# -------------------------
+def train_loop(args):
+    seed_everything(args["seed"])
+    device = args["device"]
+
+    print("Loading MPNet text encoder...")
+    mpnet = load_text_encoder(device="cpu")
+
+    print("Preparing dataset...")
+    full_ds = FeatureVideoQAHME_MC(
+        json_path=args["data_json"],
+        feature_dir_appearance=args["feat_app_dir"],
+        feature_dir_motion=args["feat_mot_dir"],
+        text_encoder=mpnet,
+        preload_text=True,
+        is_test=False
     )
-    return nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-# -------------------------
-# Video Encoder for LLM-assisted VideoQA
-# -------------------------
-class VideoEncoder(nn.Module):
-    """
-    Encode motion + appearance into a single vector per video.
-    This embedding can be used for retrieval or fed to LLM as summary.
-    """
+    # Split train/val
+    n = len(full_ds)
+    n_val = max(1, int(n * args["valid_split"]))
+    indices = list(range(n))
+    random.shuffle(indices)
+    val_idx, train_idx = indices[:n_val], indices[n_val:]
 
-    def __init__(
-        self,
-        motion_dim: int = 2304,
-        appearance_dim: int = 768,
-        hidden_dim: int = 1024,
-        motion_proj_dim: int = 1024,
-        num_motion_layers: int = 2,
-        motion_heads: int = 8,
-        dropout: float = 0.1,
-        use_mean_pool_motion: bool = True,
-    ):
-        super().__init__()
-        self.use_mean_pool_motion = use_mean_pool_motion
+    train_ds = Subset(full_ds, train_idx)
+    val_ds = Subset(full_ds, val_idx)
 
-        # Motion projection + transformer
-        self.motion_proj = nn.Linear(motion_dim, motion_proj_dim)
-        self.motion_ln = nn.LayerNorm(motion_proj_dim)
-        self.motion_encoder = build_transformer_encoder(
-            dim=motion_proj_dim,
-            num_layers=num_motion_layers,
-            num_heads=motion_heads,
-            dropout=dropout,
-        )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args["batch_size"],
+        shuffle=True,
+        num_workers=args["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn_hme
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args["batch_size"],
+        shuffle=False,
+        num_workers=args["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn_hme
+    )
 
-        # Appearance projection
-        self.appearance_proj = nn.Linear(appearance_dim, motion_proj_dim)
-        self.appearance_ln = nn.LayerNorm(motion_proj_dim)
+    print("Building HME_MC model...")
+    model = HME_MC(
+        motion_dim=args["motion_dim"],
+        appearance_dim=args["appearance_dim"],
+        text_dim=args["text_dim"],
+        hidden_dim=args["hidden_dim"],
+        motion_proj_dim=args["motion_proj_dim"],
+        num_motion_layers=args["num_motion_layers"],
+        fusion_heads=8,
+        motion_heads=8,
+        dropout=args["dropout"],
+        use_mean_pool_motion=False,  # multi-scale pooling
+        treat_text_as_query=True
+    ).to(device)
 
-        # Final fusion -> video embedding
-        self.video_proj = nn.Linear(motion_proj_dim * 2, hidden_dim)
-        self.video_ln = nn.LayerNorm(hidden_dim)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                  lr=args["lr"], weight_decay=args["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1, verbose=True)
+    scaler = GradScaler(enabled=args["use_fp16"])
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
 
-    def forward(
-        self,
-        motion_feats: torch.Tensor,          # [B, T, D_m]
-        motion_mask: Optional[torch.Tensor] = None, # [B, T] (1 for valid)
-        appearance_feats: Optional[torch.Tensor] = None  # [B, D_a]
-    ):
-        B = motion_feats.shape[0]
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    os.makedirs(args["output_dir"], exist_ok=True)
 
-        # --- Motion ---
-        mot = self.motion_proj(motion_feats)  # [B, T, M]
-        mot = self.motion_ln(mot)
+    print("Start training...")
+    for epoch in range(args["epochs"]):
+        model.train()
+        running_loss = 0.0
+        optimizer.zero_grad()
+        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args['epochs']} train")):
+            appearance = batch["appearance_feats"].to(device)
+            motion = batch["motion_feats"].to(device)
+            text = batch["text_feats"].to(device)
+            mask_motion = batch.get("motion_mask", None)
+            if mask_motion is not None:
+                mask_motion = mask_motion.to(device)
+            labels = batch.get("labels", None)
+            if labels is not None:
+                labels = labels.to(device)
 
-        if self.use_mean_pool_motion:
-            # simple mean pooling
-            if motion_mask is not None:
-                motion_mask = motion_mask.to(mot.device)
-                denom = motion_mask.sum(dim=1, keepdim=True).clamp(min=1).to(mot.dtype)
-                mot_pooled = (mot * motion_mask.unsqueeze(-1)).sum(dim=1) / denom  # [B, M]
-            else:
-                mot_pooled = mot.mean(dim=1)
-            mot_tokens = mot_pooled  # [B, M]
+            with autocast(enabled=args["use_fp16"]):
+                out = model(
+                    motion_feats=motion,
+                    motion_mask=mask_motion,
+                    appearance_feats=appearance,
+                    text_feats=text,
+                    labels=labels if (labels is not None and (labels!=-1).any()) else None
+                )
+                logits = out["logits"]
+                loss = loss_fn(logits, labels)
+                loss_to_back = loss / args["accum_steps"]
+
+            scaler.scale(loss_to_back).backward()
+
+            if (step + 1) % args["accum_steps"] == 0 or (step + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            running_loss += loss.item()
+            tqdm.write(f"Step {step+1}, Loss: {running_loss/(step+1):.4f}")
+
+        val_loss, val_acc = evaluate(model, val_loader, device, args["use_fp16"])
+        print(f"Epoch {epoch+1} - val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}")
+        scheduler.step(val_loss)
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            ckpt = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "args": args
+            }
+            torch.save(ckpt, os.path.join(args["output_dir"], "best_model.pt"))
+            print(f"Saved best_model.pt (val_loss={val_loss:.4f})")
         else:
-            # transformer encoder
-            key_padding_mask = (motion_mask == 0) if motion_mask is not None else None
-            mot_encoded = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)
-            # mean pool temporal dimension
-            if motion_mask is not None:
-                denom = motion_mask.sum(dim=1, keepdim=True).clamp(min=1)
-                mot_tokens = (mot_encoded * motion_mask.unsqueeze(-1)).sum(dim=1) / denom
-            else:
-                mot_tokens = mot_encoded.mean(dim=1)  # [B, M]
+            epochs_no_improve += 1
+            if epochs_no_improve >= args["earlystop_patience"]:
+                print("Early stopping triggered.")
+                break
 
-        # --- Appearance ---
-        if appearance_feats is not None:
-            app = self.appearance_proj(appearance_feats)
-            app = self.appearance_ln(app)
-        else:
-            # fallback zero vector
-            app = torch.zeros_like(mot_tokens)
-        
-        # --- Combine ---
-        combined = torch.cat([mot_tokens, app], dim=-1)  # [B, 2*M]
-        video_emb = self.video_ln(self.video_proj(combined))  # [B, hidden_dim]
-
-        return video_emb
+    print("Training finished.")
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss": best_val_loss,
+        "args": args
+    }, os.path.join(args["output_dir"], "last_model.pt"))
+    print("Saved last_model.pt")
 
 # -------------------------
-# Optional: Retrieval + Contrastive Loss
+# CLI
 # -------------------------
-def contrastive_loss(video_emb: torch.Tensor, text_emb: torch.Tensor, temperature: float = 0.07):
-    """
-    Simple contrastive loss (InfoNCE)
-    video_emb, text_emb: [B, D]
-    """
-    video_emb = F.normalize(video_emb, dim=-1)
-    text_emb = F.normalize(text_emb, dim=-1)
-    logits = video_emb @ text_emb.T / temperature  # [B, B]
-    labels = torch.arange(video_emb.size(0), device=video_emb.device)
-    loss_v2t = F.cross_entropy(logits, labels)
-    loss_t2v = F.cross_entropy(logits.T, labels)
-    return (loss_v2t + loss_t2v) / 2.0
+if __name__ == "__main__":
+    default_args = get_default_args()
+    parser = argparse.ArgumentParser()
+    for k, v in default_args.items():
+        parser.add_argument(f"--{k}", type=type(v), default=v)
+    parsed = vars(parser.parse_args())
+    parsed["use_fp16"] = bool(parsed["use_fp16"])
+    parsed["seed"] = int(parsed["seed"])
+    parsed["device"] = parsed["device"]
+    parsed["num_workers"] = int(parsed["num_workers"])
+    parsed["batch_size"] = int(parsed["batch_size"])
+    parsed["accum_steps"] = int(parsed["accum_steps"])
+    parsed["epochs"] = int(parsed["epochs"])
+    parsed["earlystop_patience"] = int(parsed["earlystop_patience"])
 
-
-class VideoTextContrastive(nn.Module):
-    def __init__(self, video_dim=1024, text_dim=768, temperature=0.07):
-        super().__init__()
-        self.video_dim = video_dim
-        self.text_dim = text_dim
-        self.temperature = temperature
-        # Linear projection text -> video_dim
-        self.text_proj = nn.Linear(text_dim, video_dim)
-
-    def forward(self, video_emb: torch.Tensor, text_emb: torch.Tensor):
-        # normalize embeddings
-        video_emb = F.normalize(video_emb, dim=-1)           # [B, video_dim]
-        text_emb = F.normalize(self.text_proj(text_emb), dim=-1)  # [B, video_dim]
-
-        logits = video_emb @ text_emb.T / self.temperature   # [B, B]
-        labels = torch.arange(video_emb.size(0), device=video_emb.device)
-        loss_v2t = F.cross_entropy(logits, labels)
-        loss_t2v = F.cross_entropy(logits.T, labels)
-        return (loss_v2t + loss_t2v) / 2.0
+    train_loop(parsed)
