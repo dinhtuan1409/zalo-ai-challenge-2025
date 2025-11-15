@@ -26,7 +26,7 @@ def load_clip_encoder(model_name: str = "ViT-L/14@336px", device: Optional[str] 
     clip_processor: CLIPProcessor
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    clip_model = CLIPModel.from_pretrained(f"openai/clip-ViT-L/14@336px"}")
+    clip_model = CLIPModel.from_pretrained(f"openai/clip-ViT-L/14@336px")
     clip_processor = CLIPProcessor.from_pretrained(f"openai/clip-ViT-L/14@336px")
     clip_model.eval()
     clip_model = clip_model.to(device)
