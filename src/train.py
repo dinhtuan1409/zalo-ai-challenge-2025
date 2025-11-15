@@ -253,4 +253,11 @@ if __name__ == "__main__":
     parsed = vars(parser.parse_args())
     parsed["use_fp16"] = bool(parsed["use_fp16"])
     parsed["seed"] = int(parsed["seed"])
-    parsed["device"] = parsed["device"]()
+    parsed["device"] = parsed["device"]
+    parsed["num_workers"] = int(parsed["num_workers"])
+    parsed["batch_size"] = int(parsed["batch_size"])
+    parsed["accum_steps"] = int(parsed["accum_steps"])
+    parsed["epochs"] = int(parsed["epochs"])
+    parsed["earlystop_patience"] = int(parsed["earlystop_patience"])
+
+    train_loop(parsed)
