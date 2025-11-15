@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Optional
 from PIL import Image
-
+from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
 # -------------------------
 # Video-LLaVA
 # -------------------------
@@ -34,23 +34,16 @@ def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
 # ===========================================================
 # Load Video-LLaVA
 # ===========================================================
-def load_video_llava(device: Optional[str] = None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-    model_name = "LanguageBind/Video-LLaVA-7B-hf"
-
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
+def load_video_llava(device="cuda"):
+    model_name = "LanguageBind/Video-LLaVA-7B-hf"  # lưu ý dấu - ASCII
+    model = VideoLlavaForConditionalGeneration.from_pretrained(
         model_name,
-        torch_dtype=torch.float16 if "cuda" in device else torch.float32
-    ).to(device)
-
+        torch_dtype=torch.float16 if device=="cuda" else torch.float32,
+        device_map="auto" if device=="cuda" else None
+    )
+    processor = VideoLlavaProcessor.from_pretrained(model_name)
     model.eval()
-
-    print(f"Video-LLaVA loaded on {device}")
-    return model, tokenizer, processor
+    return model, processor
 
 
 # ===========================================================
