@@ -120,8 +120,7 @@ def train_loop(args):
         feature_dir_motion=args["feat_mot_dir"],
         text_encoder=mpnet,
         vllava_model=vllava_model,
-        vllava_tokenizer=vllava_tokenizer,
-        vllava_processor=vllava_processor,
+        vllava_processor=vllava_processor,   # ✅ không có tokenizer
         frames_dict=frames_dict,
         preload_text=True,
         is_test=False
