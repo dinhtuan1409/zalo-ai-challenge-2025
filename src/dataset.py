@@ -5,9 +5,8 @@ from torch.utils.data import Dataset
 from transformers import CLIPTokenizer, CLIPModel
 from typing import List, Dict, Any, Optional
 
-
 # ================================
-# Load CLIP Text Encoder (đồng bộ với ViT-L/14@336px)
+# CLIP Text Encoder (ViT-L/14@336px)
 # ================================
 class CLIPTextEncoder(torch.nn.Module):
     def __init__(self, model_name="openai/clip-vit-large-patch14-336", trainable_layers=2):
@@ -36,18 +35,17 @@ class CLIPTextEncoder(torch.nn.Module):
         text_embeds = outputs.last_hidden_state[:, 0, :]  # CLS token
         return text_embeds.float()
 
-
 # ================================
-# Dataset for HME Multi-choice VideoQA (CLIP text)
+# Dataset LLM-assisted VideoQA
 # ================================
-class FeatureVideoQAHME_MC_CLIP(Dataset):
+class FeatureVideoQAHME_MC_LLMAssist(Dataset):
     """
-    Dataset HME-VideoQA Multi-choice:
-      - Appearance feature: [768] per video ID
-      - Motion feature: [T, 2304] per video_path
-      - Text feature: [C, hidden_size] (CLIP text encoder)
+    Dataset HME-VideoQA Multi-choice, trả về text embedding cho contrastive training:
+      - appearance: [768]
+      - motion: [T, 2304]
+      - text_feats: [C, D] (multi-choice, optional)
+      - text_emb: [D] (mean pooling of choices, để contrastive)
     """
-
     def __init__(
         self,
         json_path: str,
@@ -103,14 +101,14 @@ class FeatureVideoQAHME_MC_CLIP(Dataset):
         question = item["question"]
         choices = item["choices"]
 
-        # --- Appearance feature ---
+        # --- Appearance ---
         path_app = os.path.join(self.feature_dir_appearance, f"{qid}_appearance.pt")
         if os.path.exists(path_app):
             feat_app = torch.load(path_app).squeeze(0)  # [768]
         else:
             feat_app = torch.zeros(768)
 
-        # --- Motion feature ---
+        # --- Motion ---
         video_name = os.path.splitext(os.path.basename(item["video_path"]))[0]
         path_mot = os.path.join(self.feature_dir_motion, f"{video_name}.pt")
         if os.path.exists(path_mot):
@@ -119,12 +117,15 @@ class FeatureVideoQAHME_MC_CLIP(Dataset):
             feat_mot = torch.zeros((1, 2304))
         motion_mask = torch.ones(feat_mot.shape[0], dtype=torch.long)
 
-        # --- Text feature ---
+        # --- Text ---
         if self.preload_text:
             text_feats = self.text_cache[qid]  # [C, D]
         else:
             texts = [question + " [SEP] " + c for c in choices]
             text_feats = self.encode_text(texts)  # [C, D]
+
+        # --- text embedding cho contrastive loss ---
+        text_emb = text_feats.mean(dim=0)  # [D]
 
         # --- Label ---
         label = -1
@@ -142,11 +143,11 @@ class FeatureVideoQAHME_MC_CLIP(Dataset):
             "motion_feat": feat_mot,
             "motion_mask": motion_mask,
             "text_feats": text_feats,
+            "text_emb": text_emb,
+            "label": label,
             "question": question,
             "choice_texts": choices,
-            "label": label,
         }
-
 
 # ================================
 # Collate function
@@ -162,20 +163,20 @@ def collate_fn_hme_clip(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         motion_feats[i, :T_b] = b["motion_feat"]
         motion_mask[i, :T_b] = b["motion_mask"]
 
-    # --- Appearance ---
-    appearance_feats = torch.stack([b["appearance_feat"] for b in batch], dim=0)  # [B, 768]
+    appearance_feats = torch.stack([b["appearance_feat"] for b in batch], dim=0)
 
-    # --- Text ---
+    # --- text_feats multi-choice ---
     feat_dim = batch[0]["text_feats"].shape[1]
     max_C = max(b["text_feats"].shape[0] for b in batch)
-    text_feats = torch.zeros((B, max_C, feat_dim), device=batch[0]["text_feats"].device)
+    text_feats = torch.zeros((B, max_C, feat_dim))
     for i, b in enumerate(batch):
         C_b = b["text_feats"].shape[0]
         text_feats[i, :C_b] = b["text_feats"]
 
-    # --- Labels ---
-    labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
+    # --- text_emb cho contrastive ---
+    text_embs = torch.stack([b["text_emb"] for b in batch], dim=0)  # [B, D]
 
+    labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
     questions = [b["question"] for b in batch]
     choice_texts = [b["choice_texts"] for b in batch]
     ids = [b["id"] for b in batch]
@@ -186,6 +187,7 @@ def collate_fn_hme_clip(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "motion_feats": motion_feats,
         "motion_mask": motion_mask,
         "text_feats": text_feats,
+        "text_emb": text_embs,       # ⚡ dùng cho LLM-assisted contrastive
         "labels": labels,
         "questions": questions,
         "choice_texts": choice_texts,
