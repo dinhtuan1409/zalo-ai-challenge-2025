@@ -1,32 +1,44 @@
-# dataset_hme.py
+# dataset_hme_clip.py
 import os
 import json
 import torch
 from torch.utils.data import Dataset
 from sentence_transformers import SentenceTransformer
+from transformers import CLIPProcessor, CLIPModel
 from typing import List, Dict, Any, Optional
+from PIL import Image
 
 # ===========================================================
-# ✅ Load Text Encoder
+# ✅ Load MPNet Text Encoder
 # ===========================================================
 def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2", trust_remote_code=True)
     model.eval()
     model = model.to(device)
-    print(f"Text encoder loaded on {device}")
+    print(f"MPNet text encoder loaded on {device}")
     return model
 
+# ===========================================================
+# ✅ Extract CLIP caption embedding (ViT-L/14@336px)
+# ===========================================================
+@torch.no_grad()
+def extract_clip_caption_embeddings(frames: List[Image.Image], clip_model, clip_processor, device=None):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    inputs = clip_processor(images=frames, return_tensors="pt").to(device)
+    outputs = clip_model.get_image_features(**inputs)  # [num_frames, 768]
+    video_emb = outputs.mean(dim=0, keepdim=True)      # [1, 768]
+    return video_emb.float().cpu()  # return on CPU
 
 # ===========================================================
-# ✅ Dataset for HME-VideoQA Multi-choice
+# ✅ Dataset for HME-VideoQA Multi-choice + CLIP caption
 # ===========================================================
 class FeatureVideoQAHME_MC(Dataset):
     """
     Dataset cho HME Multi-choice VideoQA
       - Appearance feature: [B, 768] (saved per video ID)
       - Motion feature: [B, T, 2304] (saved per video_path)
-      - Text feature: [B, C, 768] (MPNet embeddings)
+      - Text feature: [C, 768] MPNet + [C, 768] CLIP caption → [C, 1536]
     """
 
     def __init__(
@@ -37,6 +49,9 @@ class FeatureVideoQAHME_MC(Dataset):
         text_encoder: Optional[SentenceTransformer] = None,
         preload_text: bool = True,
         is_test: bool = False,
+        clip_model: Optional[CLIPModel] = None,
+        clip_processor: Optional[CLIPProcessor] = None,
+        frames_dict: Optional[Dict[str, List[Image.Image]]] = None,  # video_name -> list of PIL frames
     ):
         with open(json_path, "r", encoding="utf-8") as f:
             self.items = json.load(f)["data"]
@@ -48,9 +63,13 @@ class FeatureVideoQAHME_MC(Dataset):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.text_encoder = text_encoder or load_text_encoder(self.device)
 
+        self.clip_model = clip_model
+        self.clip_processor = clip_processor
+        self.frames_dict = frames_dict or {}
+
         self.preload_text = preload_text
         if preload_text:
-            print("⚡ Pre-encoding all text (MPNet)...")
+            print("⚡ Pre-encoding all text + CLIP caption embeddings...")
             self.text_cache = self._pre_encode_all_text()
         else:
             self.text_cache = None
@@ -66,17 +85,37 @@ class FeatureVideoQAHME_MC(Dataset):
             qid = item["id"]
             question = item["question"]
             choices = item["choices"]
+            video_name = os.path.splitext(os.path.basename(item["video_path"]))[0]
+
+            # --- MPNet encoding ---
             texts = [question + " [SEP] " + c for c in choices]
-            emb = self.text_encoder.encode(
+            mpnet_emb = self.text_encoder.encode(
                 texts, convert_to_tensor=True, device=self.device, show_progress_bar=False
-            )
-            cache[qid] = emb.float().cpu()
+            ).float().cpu()  # [C, 768]
+
+            # --- CLIP caption embedding ---
+            clip_emb = torch.zeros((1, 768))
+            if self.clip_model and self.clip_processor and video_name in self.frames_dict:
+                clip_emb = extract_clip_caption_embeddings(
+                    self.frames_dict[video_name], self.clip_model, self.clip_processor, device=self.device
+                )  # [1, 768]
+            clip_emb = clip_emb.expand(mpnet_emb.shape[0], -1)  # [C, 768]
+
+            # --- Concatenate MPNet + CLIP ---
+            combined_emb = torch.cat([mpnet_emb, clip_emb], dim=1)  # [C, 1536]
+            cache[qid] = combined_emb
         return cache
 
     @torch.no_grad()
-    def encode_text(self, texts: List[str]) -> torch.Tensor:
-        emb = self.text_encoder.encode(texts, convert_to_tensor=True, device=self.device, show_progress_bar=False)
-        return emb.float().cpu()
+    def encode_text(self, texts: List[str], video_name: Optional[str] = None) -> torch.Tensor:
+        mpnet_emb = self.text_encoder.encode(texts, convert_to_tensor=True, device=self.device, show_progress_bar=False).float().cpu()
+        clip_emb = torch.zeros((1, 768))
+        if self.clip_model and self.clip_processor and video_name in self.frames_dict:
+            clip_emb = extract_clip_caption_embeddings(
+                self.frames_dict[video_name], self.clip_model, self.clip_processor, device=self.device
+            )
+        clip_emb = clip_emb.expand(mpnet_emb.shape[0], -1)
+        return torch.cat([mpnet_emb, clip_emb], dim=1)  # [C, 1536]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
@@ -99,10 +138,10 @@ class FeatureVideoQAHME_MC(Dataset):
 
         # --- Text feature ---
         if self.preload_text:
-            text_feats = self.text_cache[qid]          # [C, 768]
+            text_feats = self.text_cache[qid]          # [C, 1536]
         else:
             texts = [question + " [SEP] " + c for c in choices]
-            text_feats = self.encode_text(texts)
+            text_feats = self.encode_text(texts, video_name=video_name)
 
         # --- Label ---
         label = -1
@@ -119,24 +158,17 @@ class FeatureVideoQAHME_MC(Dataset):
             "appearance_feat": feat_app,       # [768]
             "motion_feat": feat_mot,           # [T, 2304]
             "motion_mask": motion_mask,        # [T]
-            "text_feats": text_feats,          # [C, 768]
+            "text_feats": text_feats,          # [C, 1536]
             "question": question,
             "choice_texts": choices,
             "label": label
         }
 
-
 # ===========================================================
-# ✅ Collate function
+# ✅ Collate function (unchanged)
 # ===========================================================
 def collate_fn_hme(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Collate for HME MC VideoQA
-      - Pads motion features to max T in batch
-      - Stacks appearance, text, labels
-    """
     batch_size = len(batch)
-    # --- Motion ---
     max_T = max(b["motion_feat"].shape[0] for b in batch)
     motion_feats = torch.zeros((batch_size, max_T, 2304))
     motion_mask = torch.zeros((batch_size, max_T), dtype=torch.long)
@@ -145,20 +177,15 @@ def collate_fn_hme(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         motion_feats[i, :T_b] = b["motion_feat"]
         motion_mask[i, :T_b] = b["motion_mask"]
 
-    # --- Appearance ---
-    appearance_feats = torch.stack([b["appearance_feat"] for b in batch], dim=0)  # [B, 768]
+    appearance_feats = torch.stack([b["appearance_feat"] for b in batch], dim=0)
 
-    # --- Text ---
     max_C = max(b["text_feats"].shape[0] for b in batch)
-    text_feats = torch.zeros((batch_size, max_C, 768))
+    text_feats = torch.zeros((batch_size, max_C, batch[0]["text_feats"].shape[1]))  # [B, C, 1536]
     for i, b in enumerate(batch):
         C_b = b["text_feats"].shape[0]
         text_feats[i, :C_b] = b["text_feats"]
 
-    # --- Labels ---
     labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
-
-    # --- Raw text ---
     questions = [b["question"] for b in batch]
     choice_texts = [b["choice_texts"] for b in batch]
     ids = [b["id"] for b in batch]
