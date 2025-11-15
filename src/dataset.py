@@ -19,18 +19,17 @@ def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
     print(f"MPNet text encoder loaded on {device}")
     return model
 
-def load_clip_encoder(model_name: str = "ViT-L/14@336px", device: Optional[str] = None):
+def load_clip_encoder(device: Optional[str] = None):
     """
-    Trả về (clip_model, clip_processor)
-    clip_model: CLIPModel
-    clip_processor: CLIPProcessor
+    Load CLIP ViT-L/14 (large, patch14) encoder
+    Returns: clip_model, clip_processor
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    clip_model = CLIPModel.from_pretrained(f"openai/clip-ViT-L/14@336px")
-    clip_processor = CLIPProcessor.from_pretrained(f"openai/clip-ViT-L/14@336px")
+    clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
     clip_model.eval()
-    clip_model = clip_model.to(device)
-    print(f"CLIP encoder {model_name} loaded on {device}")
+    clip_model.to(device)
+    print(f"CLIP ViT-L/14 loaded on {device}")
     return clip_model, clip_processor
 
 # ===========================================================
