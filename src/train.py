@@ -14,8 +14,8 @@ from torch.cuda.amp import autocast, GradScaler
 
 # --- import your modules ---
 from model import HME_MC
-from dataset import FeatureVideoQAHME_MC, load_text_encoder, collate_fn_hme
-from dataset import load_clip_encoder   # thêm hàm load CLIP encoder
+from dataset_hme_vllava import FeatureVideoQAHME_MC, load_text_encoder, collate_fn_hme
+from dataset_hme_vllava import load_video_llava
 
 # -------------------------
 # Config / Hyperparameters
@@ -38,7 +38,7 @@ def get_default_args():
         "num_workers": 4,
         "motion_dim": 2304,
         "appearance_dim": 768,
-        "text_dim": 1536,           # MPNet+CLIP
+        "text_dim": 1536,           # MPNet+Video-LLaVA
         "motion_proj_dim": 1024,
         "hidden_dim": 1024,
         "num_motion_layers": 2,
@@ -104,9 +104,13 @@ def train_loop(args):
     device = args["device"]
 
     # --- Load encoders ---
-    print("Loading MPNet + CLIP encoders...")
-    mpnet = load_text_encoder(device="cpu")
-    clip_model, clip_preprocess = load_clip_encoder( device="cpu")
+    print("Loading MPNet + Video-LLaVA encoders...")
+    mpnet = load_text_encoder(device=device)
+    vllava_model, vllava_tokenizer, vllava_processor = load_video_llava(device=device)
+
+    # --- Load frames dict (video_name -> list of PIL.Image frames) ---
+    # Bạn cần chuẩn bị dict frames_dict trước
+    frames_dict = {}  # Ví dụ: {"video1": [PIL.Image,...], "video2": [...], ...}
 
     # --- Dataset ---
     print("Preparing dataset...")
@@ -115,12 +119,15 @@ def train_loop(args):
         feature_dir_appearance=args["feat_app_dir"],
         feature_dir_motion=args["feat_mot_dir"],
         text_encoder=mpnet,
-        clip_model=clip_model,             # ✅ đúng
-        clip_processor=clip_preprocess, 
+        vllava_model=vllava_model,
+        vllava_tokenizer=vllava_tokenizer,
+        vllava_processor=vllava_processor,
+        frames_dict=frames_dict,
         preload_text=True,
         is_test=False
     )
 
+    # --- Train/Val split ---
     n = len(full_ds)
     n_val = max(1, int(n * args["valid_split"]))
     indices = list(range(n))
@@ -171,7 +178,7 @@ def train_loop(args):
         for step, batch in enumerate(pbar):
             appearance = batch["appearance_feats"].to(device)
             motion = batch["motion_feats"].to(device)
-            text = batch["text_feats"].to(device)       # [B,C,1536]
+            text = batch["text_feats"].to(device)
             mask_motion = batch.get("motion_mask", None)
             if mask_motion is not None:
                 mask_motion = mask_motion.to(device)
@@ -246,11 +253,4 @@ if __name__ == "__main__":
     parsed = vars(parser.parse_args())
     parsed["use_fp16"] = bool(parsed["use_fp16"])
     parsed["seed"] = int(parsed["seed"])
-    parsed["device"] = parsed["device"]
-    parsed["num_workers"] = int(parsed["num_workers"])
-    parsed["batch_size"] = int(parsed["batch_size"])
-    parsed["accum_steps"] = int(parsed["accum_steps"])
-    parsed["epochs"] = int(parsed["epochs"])
-    parsed["earlystop_patience"] = int(parsed["earlystop_patience"])
-
-    train_loop(parsed)
+    parsed["device"] = parsed["device"]()
