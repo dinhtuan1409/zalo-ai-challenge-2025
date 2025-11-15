@@ -107,7 +107,11 @@ class HME_MC(nn.Module):
                 mot_pooled = mot.mean(dim=1)
             mot_tokens = mot_pooled.unsqueeze(1)  # [B, 1, M]
         else:
-            key_padding_mask = (motion_mask == 0) if motion_mask is not None else None
+            key_padding_mask = None
+            if video_mask is not None:
+                key_padding_mask = (video_mask == 0)        # bool mask
+                key_padding_mask = key_padding_mask.repeat_interleave(C, dim=0)
+
             mot_tokens = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)  # [B, T, M]
 
         # --- Appearance ---
@@ -118,7 +122,7 @@ class HME_MC(nn.Module):
         # --- Video tokens + mask ---
         video_tokens = torch.cat([app_tok, mot_tokens], dim=1)  # [B, T+1, M]
         if motion_mask is not None:
-            app_mask = torch.ones((B, 1), dtype=motion_mask.dtype, device=device)
+            app_mask = torch.ones((B,1), dtype=torch.bool, device=device)
             video_mask = torch.cat([app_mask, motion_mask], dim=1)
         else:
             video_mask = None
