@@ -77,6 +77,7 @@ class VideoEncoder(nn.Module):
         if self.use_mean_pool_motion:
             # simple mean pooling
             if motion_mask is not None:
+                motion_mask = motion_mask.to(mot.device)
                 denom = motion_mask.sum(dim=1, keepdim=True).clamp(min=1).to(mot.dtype)
                 mot_pooled = (mot * motion_mask.unsqueeze(-1)).sum(dim=1) / denom  # [B, M]
             else:
