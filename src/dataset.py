@@ -37,7 +37,8 @@ def load_text_encoder(device: Optional[str] = None) -> SentenceTransformer:
 def load_video_llava(device: Optional[str] = None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_name = "LanguageBind/Video‑LLaVA‑7B-hf"
+    model_name = "LanguageBind/Video-LLaVA-7B-hf"
+
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     processor = AutoProcessor.from_pretrained(model_name)
