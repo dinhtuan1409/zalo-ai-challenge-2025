@@ -88,11 +88,10 @@ class HME_MC(nn.Module):
         motion_feats: torch.Tensor,      # [B, T, 2304]
         motion_mask: Optional[torch.Tensor],  # [B, T]
         appearance_feats: torch.Tensor,  # [B, 768]
-        text_feats: torch.Tensor,        # [B, C, 1536] (MPNet + Video-LLaVA)
+        text_feats: torch.Tensor,        # [B, C, 1536]
         labels: Optional[torch.Tensor] = None,
     ):
-        B = motion_feats.shape[0]
-        device = motion_feats.device
+        B, device = motion_feats.shape[0], motion_feats.device
 
         # --- Project motion ---
         mot = self.motion_proj(motion_feats)
@@ -105,46 +104,43 @@ class HME_MC(nn.Module):
                 mot_pooled = (mot * motion_mask.unsqueeze(-1)).sum(dim=1) / denom
             else:
                 mot_pooled = mot.mean(dim=1)
-            mot_tokens = mot_pooled.unsqueeze(1)  # [B, 1, M]
+            mot_tokens = mot_pooled.unsqueeze(1)  # [B,1,M]
         else:
-            key_padding_mask = None
-            if video_mask is not None:
-                key_padding_mask = (video_mask == 0)        # bool mask
-                key_padding_mask = key_padding_mask.repeat_interleave(C, dim=0)
-
-            mot_tokens = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)  # [B, T, M]
+            key_padding_mask = motion_mask.bool() == 0 if motion_mask is not None else None
+            mot_tokens = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)  # [B,T,M]
 
         # --- Appearance ---
         app = self.appearance_proj(appearance_feats)
         app = self.appearance_ln(app)
-        app_tok = app.unsqueeze(1)  # [B, 1, M]
+        app_tok = app.unsqueeze(1)  # [B,1,M]
 
         # --- Video tokens + mask ---
-        video_tokens = torch.cat([app_tok, mot_tokens], dim=1)  # [B, T+1, M]
+        video_tokens = torch.cat([app_tok, mot_tokens], dim=1)  # [B,T+1,M]
         if motion_mask is not None:
             app_mask = torch.ones((B,1), dtype=torch.bool, device=device)
-            video_mask = torch.cat([app_mask, motion_mask], dim=1)
+            motion_mask_bool = motion_mask.bool()
+            video_mask = torch.cat([app_mask, motion_mask_bool], dim=1)  # [B,T+1]
         else:
             video_mask = None
 
         # --- Text projection ---
         B, C, _ = text_feats.shape
-        txt = self.text_proj(text_feats)       # [B, C, M]
+        txt = self.text_proj(text_feats)  # [B,C,M]
         txt = self.text_ln(txt)
 
-        # --- Cross-attention: each text choice queries video tokens ---
-        queries = txt.reshape(B * C, 1, -1)                       # [B*C, 1, M]
-        keys = video_tokens.repeat_interleave(C, dim=0)           # [B*C, T+1, M]
+        # --- Cross-attention ---
+        queries = txt.reshape(B*C,1,-1)                # [B*C,1,M]
+        keys = video_tokens.repeat_interleave(C, dim=0)  # [B*C, T+1, M]
         key_padding_mask = video_mask.repeat_interleave(C, dim=0) if video_mask is not None else None
 
-        attn_out, _ = self.cross_attn(queries, keys, keys, key_padding_mask=key_padding_mask)
-        attn_out = self.cross_attn_ln(attn_out.squeeze(1))       # [B*C, M]
-        fused = self.fusion_ln(self.fusion_ff(attn_out))         # [B*C, M]
+        attn_out,_ = self.cross_attn(queries, keys, keys, key_padding_mask=key_padding_mask)
+        attn_out = self.cross_attn_ln(attn_out.squeeze(1))  # [B*C,M]
+        fused = self.fusion_ln(self.fusion_ff(attn_out))    # [B*C,M]
 
         # --- Classifier ---
-        txt_flat = txt.reshape(B * C, -1)
-        combined = torch.cat([txt_flat, fused], dim=-1)          # [B*C, 2M]
-        logits = self.classifier(combined).view(B, C)            # [B, C]
+        txt_flat = txt.reshape(B*C,-1)
+        combined = torch.cat([txt_flat, fused], dim=-1)  # [B*C,2M]
+        logits = self.classifier(combined).view(B,C)
 
         output = {"logits": logits}
         if labels is not None:
