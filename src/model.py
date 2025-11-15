@@ -1,116 +1,124 @@
+# model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
-# -----------------------
-# Simple Transformer Block
-# -----------------------
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.1):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.ln1 = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, int(dim*mlp_ratio)),
-            nn.GELU(),
-            nn.Linear(int(dim*mlp_ratio), dim)
-        )
-        self.ln2 = nn.LayerNorm(dim)
+# -------------------------
+# Utility: TransformerEncoder block
+# -------------------------
+def build_transformer_encoder(dim, num_layers=2, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+    """
+    Simple Transformer encoder (motion temporal modeling)
+    """
+    encoder_layer = nn.TransformerEncoderLayer(
+        d_model=dim,
+        nhead=num_heads,
+        dim_feedforward=int(dim * mlp_ratio),
+        dropout=dropout,
+        activation="gelu",
+        batch_first=True  # input shape: [B, S, D]
+    )
+    return nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    def forward(self, x, mask=None):
-        attn_out, _ = self.attn(x, x, x, key_padding_mask=mask)
-        x = self.ln1(x + attn_out)
-        x = self.ln2(x + self.ff(x))
-        return x
+# -------------------------
+# Video Encoder for LLM-assisted VideoQA
+# -------------------------
+class VideoEncoder(nn.Module):
+    """
+    Encode motion + appearance into a single vector per video.
+    This embedding can be used for retrieval or fed to LLM as summary.
+    """
 
-
-# -----------------------
-# Cross Attention
-# -----------------------
-class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=8):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.ln = nn.LayerNorm(dim)
-
-    def forward(self, q, kv):
-        # q: [B,1,dim]
-        # kv: [B,T,dim]
-        out, _ = self.attn(q, kv, kv)
-        return self.ln(q + out)
-
-
-# -----------------------
-# Improved Model
-# -----------------------
-class SimpleVideoQAMC(nn.Module):
     def __init__(
         self,
-        motion_dim=2304,
-        appearance_dim=768,
-        text_dim=768,
-        hidden_dim=1024,
-        motion_proj_dim=1024,
-        num_motion_layers=2,
-        num_heads=8
+        motion_dim: int = 2304,
+        appearance_dim: int = 768,
+        hidden_dim: int = 1024,
+        motion_proj_dim: int = 1024,
+        num_motion_layers: int = 2,
+        motion_heads: int = 8,
+        dropout: float = 0.1,
+        use_mean_pool_motion: bool = True,
     ):
         super().__init__()
+        self.use_mean_pool_motion = use_mean_pool_motion
 
-        # ----- Projections -----
+        # Motion projection + transformer
         self.motion_proj = nn.Linear(motion_dim, motion_proj_dim)
-        self.appearance_proj = nn.Linear(appearance_dim, hidden_dim)
-        self.text_proj = nn.Linear(text_dim, hidden_dim)
-
-        # ----- Motion encoder -----
-        self.motion_transformer = nn.ModuleList([
-            TransformerBlock(motion_proj_dim, num_heads=num_heads)
-            for _ in range(num_motion_layers)
-        ])
-
-        # ----- Fuse motion + appearance -----
-        self.motion_to_app = CrossAttention(hidden_dim, num_heads)
-
-        # ----- Text cross-attention -----
-        self.text_attend_video = CrossAttention(hidden_dim, num_heads)
-
-        # ----- Classifier -----
-        self.cls_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, 4)
+        self.motion_ln = nn.LayerNorm(motion_proj_dim)
+        self.motion_encoder = build_transformer_encoder(
+            dim=motion_proj_dim,
+            num_layers=num_motion_layers,
+            num_heads=motion_heads,
+            dropout=dropout,
         )
 
-    def forward(self, motion_feats, motion_mask, appearance_feats, text_feats, labels=None):
-        """
-        motion_feats: [B,T,2304]
-        appearance_feats: [B,768]
-        text_feats:  [B,C,768]
-        """
+        # Appearance projection
+        self.appearance_proj = nn.Linear(appearance_dim, motion_proj_dim)
+        self.appearance_ln = nn.LayerNorm(motion_proj_dim)
 
-        # Project features
-        motion = self.motion_proj(motion_feats)       # [B,T,1024]
-        app = self.appearance_proj(appearance_feats)  # [B,1024]
-        text = self.text_proj(text_feats)             # [B,C,1024]
+        # Final fusion -> video embedding
+        self.video_proj = nn.Linear(motion_proj_dim * 2, hidden_dim)
+        self.video_ln = nn.LayerNorm(hidden_dim)
 
-        # ----- Encode motion -----
-        for blk in self.motion_transformer:
-            motion = blk(motion, mask=motion_mask)
+    def forward(
+        self,
+        motion_feats: torch.Tensor,          # [B, T, D_m]
+        motion_mask: Optional[torch.Tensor] = None, # [B, T] (1 for valid)
+        appearance_feats: Optional[torch.Tensor] = None  # [B, D_a]
+    ):
+        B = motion_feats.shape[0]
 
-        # Summary token for motion
-        motion_token = motion.mean(dim=1, keepdim=True)   # [B,1,1024]
+        # --- Motion ---
+        mot = self.motion_proj(motion_feats)  # [B, T, M]
+        mot = self.motion_ln(mot)
 
-        # ----- Fuse appearance -----
-        app = app.unsqueeze(1)                            # [B,1,1024]
-        fused_video = self.motion_to_app(app, motion)     # app attends to motion
+        if self.use_mean_pool_motion:
+            # simple mean pooling
+            if motion_mask is not None:
+                denom = motion_mask.sum(dim=1, keepdim=True).clamp(min=1).to(mot.dtype)
+                mot_pooled = (mot * motion_mask.unsqueeze(-1)).sum(dim=1) / denom  # [B, M]
+            else:
+                mot_pooled = mot.mean(dim=1)
+            mot_tokens = mot_pooled  # [B, M]
+        else:
+            # transformer encoder
+            key_padding_mask = (motion_mask == 0) if motion_mask is not None else None
+            mot_encoded = self.motion_encoder(mot, src_key_padding_mask=key_padding_mask)
+            # mean pool temporal dimension
+            if motion_mask is not None:
+                denom = motion_mask.sum(dim=1, keepdim=True).clamp(min=1)
+                mot_tokens = (mot_encoded * motion_mask.unsqueeze(-1)).sum(dim=1) / denom
+            else:
+                mot_tokens = mot_encoded.mean(dim=1)  # [B, M]
 
-        # ----- Text attends to video -----
-        fused_text = self.text_attend_video(text, fused_video)
+        # --- Appearance ---
+        if appearance_feats is not None:
+            app = self.appearance_proj(appearance_feats)
+            app = self.appearance_ln(app)
+        else:
+            # fallback zero vector
+            app = torch.zeros_like(mot_tokens)
+        
+        # --- Combine ---
+        combined = torch.cat([mot_tokens, app], dim=-1)  # [B, 2*M]
+        video_emb = self.video_ln(self.video_proj(combined))  # [B, hidden_dim]
 
-        # Mean pooling
-        video_repr = fused_text.mean(dim=1)
+        return video_emb
 
-        logits = self.cls_head(video_repr)
-
-        return {"logits": logits}
+# -------------------------
+# Optional: Retrieval + Contrastive Loss
+# -------------------------
+def contrastive_loss(video_emb: torch.Tensor, text_emb: torch.Tensor, temperature: float = 0.07):
+    """
+    Simple contrastive loss (InfoNCE)
+    video_emb, text_emb: [B, D]
+    """
+    video_emb = F.normalize(video_emb, dim=-1)
+    text_emb = F.normalize(text_emb, dim=-1)
+    logits = video_emb @ text_emb.T / temperature  # [B, B]
+    labels = torch.arange(video_emb.size(0), device=video_emb.device)
+    loss_v2t = F.cross_entropy(logits, labels)
+    loss_t2v = F.cross_entropy(logits.T, labels)
+    return (loss_v2t + loss_t2v) / 2.0
